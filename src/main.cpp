@@ -16,6 +16,8 @@
 #include <time.h>
 #include <esp_sleep.h>
 #include <esp_bt.h>
+#include <esp_system.h>
+#include <driver/rtc_io.h>
 #include <algorithm>
 #include <vector>
 
@@ -170,6 +172,19 @@ class Storage {
   }
   void saveMaintenanceMode(bool enabled) {
     Preferences p; if (p.begin("settings", false)) { p.putBool("maint", enabled); p.end(); }
+  }
+  // Persistiert Reset-/Wakeup-Ursache und einen Zaehler fuer Spontan-Wakeups
+  // (EXT0 ohne tatsaechlichen Tastendruck). Ohne angeschlossenen Rechner sieht
+  // niemand eine reine Serial-Logzeile live - dieser Zaehler bleibt dagegen bis
+  // zur naechsten Verbindung auslesbar.
+  uint32_t recordWakeDiagnostics(int resetReason, int wakeupCause, bool spurious) {
+    Preferences p; if (!p.begin("settings", false)) return 0;
+    p.putInt("rstReason", resetReason);
+    p.putInt("wakeCause", wakeupCause);
+    uint32_t count = p.getUInt("spuriousCnt", 0);
+    if (spurious) { count += 1; p.putUInt("spuriousCnt", count); }
+    p.end();
+    return count;
   }
   bool loadWifiHint(uint8_t *bssid, int32_t &channel) {
     Preferences p; if (!p.begin("tibber", true) || !p.isKey("wifiBssid")) return false;
@@ -465,6 +480,10 @@ class TibberConnection {
   explicit TibberConnection(Storage &s) : storage(s) {}
   bool connect(const RuntimeConfig &cfg) {
     WiFi.persistent(false); WiFi.setAutoReconnect(false); WiFi.mode(WIFI_STA);
+    // Reduzierte Sendeleistung fuer den normalen Betrieb: Heimrouter sind meist
+    // nah genug, volle Leistung (wie im Setup-AP) ist hier unnoetiger Verbrauch.
+    // Bei Verbindungsproblemen durch schwaches Signal hier zuerst pruefen/anheben.
+    WiFi.setTxPower(WIFI_POWER_15dBm);
     uint8_t bssid[6] = {}; int32_t channel = 0;
     // Reusing the last access point and radio channel avoids a full scan on most wakes.
     if (storage.loadWifiHint(bssid, channel)) WiFi.begin(cfg.ssid.c_str(), cfg.password.c_str(), channel, bssid, true);
@@ -528,7 +547,17 @@ uint32_t nextSleepSeconds() {
   }
   return nextWake > now ? static_cast<uint32_t>(nextWake - now) : AppConfig::FALLBACK_SLEEP_SECONDS;
 }
-void sleepFor(uint32_t seconds, bool enableTimerWakeup) { if (enableTimerWakeup) { esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL); } esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON, 0); esp_deep_sleep_start(); }
+void sleepFor(uint32_t seconds, bool enableTimerWakeup) {
+  if (enableTimerWakeup) { esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL); }
+  // pinMode(INPUT_PULLUP) haelt den Pull-Up nur im normalen Digitalbetrieb.
+  // Fuer EXT0-Wakeup muss der Pull-Up ueber die RTC-GPIO-API gesetzt werden,
+  // sonst kann der Pin waehrend des eigentlichen Deep Sleep floaten und durch
+  // Stoerungen einen Spontan-Wakeup ohne Tastendruck ausloesen.
+  rtc_gpio_pullup_en((gpio_num_t)REFRESH_BUTTON);
+  rtc_gpio_pulldown_dis((gpio_num_t)REFRESH_BUTTON);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)REFRESH_BUTTON, 0);
+  esp_deep_sleep_start();
+}
 
 
 KeyHoldResult readKeyHold() {
@@ -604,11 +633,16 @@ Storage storage;
 DisplayDriver display;
 
 void setup() {
+  // Kein delay() nach Serial.begin(): im Batteriebetrieb haengt kein Rechner
+  // am USB-Port, jede Wartezeit hier kostet nur unnoetig Strom bei jedem der
+  // 24 Wakes/Tag. Native USB-CDC muss nicht "anlaufen" wie klassisches UART.
   Serial.begin(115200);
-  delay(200);
 
   pinMode(SYS_OUT_LATCH, OUTPUT);
   digitalWrite(SYS_OUT_LATCH, HIGH);
+
+  const esp_reset_reason_t resetReason = esp_reset_reason();
+  const esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
 
   setenv("TZ", AppConfig::TIMEZONE, 1); tzset(); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
   Wire.begin(PMIC_SDA, PMIC_SCL);
@@ -620,7 +654,16 @@ void setup() {
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) esp_bt_controller_disable();
 
   bool maintenanceMode = storage.loadMaintenanceMode();
-  switch (readKeyHold()) {
+  const KeyHoldResult keyHold = readKeyHold();
+
+  // Spontan-Wakeup: das Geraet ist per EXT0 (Taste) aufgewacht, aber es liegt
+  // kein echter Tastendruck vor. Deutet auf einen Floating-Pin waehrend des
+  // Deep Sleep hin (siehe rtc_gpio_pullup_en in sleepFor()).
+  const bool spuriousExt0 = wakeupCause == ESP_SLEEP_WAKEUP_EXT0 && keyHold == KeyHoldResult::NONE;
+  uint32_t spuriousCount = storage.recordWakeDiagnostics(static_cast<int>(resetReason), static_cast<int>(wakeupCause), spuriousExt0);
+  Serial.printf("Boot: reset=%d wakeup=%d spontane-ext0-wakeups=%u\n", static_cast<int>(resetReason), static_cast<int>(wakeupCause), spuriousCount);
+
+  switch (keyHold) {
     case KeyHoldResult::FACTORY_RESET:
       storage.eraseConfigAndSnapshot();
       Serial.println("Werksreset: Konfiguration und Cache geloescht.");
