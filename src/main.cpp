@@ -53,7 +53,18 @@ struct RuntimeConfig {
   bool configured() const { return !ssid.isEmpty() && !password.isEmpty() && tibberToken.length() >= 10; }
 };
 
-struct PricePoint { String startsAt; float totalEurPerKwh = 0; String currency = "EUR"; };
+struct PricePoint {
+  String startsAt;
+  float totalEurPerKwh = 0;
+  String currency = "EUR";
+  PricePoint() = default;
+  // Expliziter Konstruktor: Default-Werte oben machen die Struktur unter
+  // C++11 (PlatformIOs Standardeinstellung fuer diese Arduino-Toolchain) zu
+  // keinem Aggregate mehr - push_back({a, b, c}) braucht daher diesen
+  // Konstruktor statt Aggregate-Initialisierung.
+  PricePoint(String startsAt_, float totalEurPerKwh_, String currency_)
+      : startsAt(std::move(startsAt_)), totalEurPerKwh(totalEurPerKwh_), currency(std::move(currency_)) {}
+};
 
 struct PriceSnapshot {
   String fetchedAt, homeId, staleReason;
