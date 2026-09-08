@@ -416,12 +416,16 @@ class DisplayDriver {
         display.setCursor(bx - tw - 6, by + bh - 3);
         display.print(pctText);
         if (battery.charging) {
-          const int lx = bx - tw - 24; // linker Ankerpunkt, links vom Prozenttext
-          const int ly = by;           // obere Kante auf Hoehe des Batteriegehaeuses
-          // Blitz aus zwei Dreiecken: oberer Teil faellt nach rechts-unten,
-          // unterer Teil schiesst nach links-unten weiter - klassische Zickzackform.
-          display.fillTriangle(lx + 6, ly, lx, ly + 8, lx + 5, ly + 8, GxEPD_BLACK);
-          display.fillTriangle(lx + 5, ly + 8, lx + 9, ly + 6, lx + 3, ly + 14, GxEPD_BLACK);
+          // Blitz sitzt jetzt im Batteriegehaeuse statt links davon, damit
+          // beides als eine Einheit wirkt. Weisse Fuellung mit schwarzer
+          // Kontur, damit er auf jeder Fuellfarbe (gruen/gelb/rot) lesbar
+          // bleibt. Bolt ist 9px breit, 14px hoch - zentriert im 25x14-Gehaeuse.
+          const int lx = bx + 8;
+          const int ly = by;
+          display.fillTriangle(lx + 6, ly, lx, ly + 8, lx + 5, ly + 8, GxEPD_WHITE);
+          display.fillTriangle(lx + 5, ly + 8, lx + 9, ly + 6, lx + 3, ly + 14, GxEPD_WHITE);
+          display.drawTriangle(lx + 6, ly, lx, ly + 8, lx + 5, ly + 8, GxEPD_BLACK);
+          display.drawTriangle(lx + 5, ly + 8, lx + 9, ly + 6, lx + 3, ly + 14, GxEPD_BLACK);
         }
       }
     } while (display.nextPage());
