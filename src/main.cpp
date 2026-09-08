@@ -1,3 +1,7 @@
+// ============================================================================
+// VERSION: v1.0.0 (STABLE) - auf echter Hardware getestet
+// Branch: main
+// ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
