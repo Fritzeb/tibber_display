@@ -1,3 +1,9 @@
+// ============================================================================
+// VERSION: BETA - basiert auf v1.0.0 (stable)
+// Branch: experimente
+// Aktuelles Experiment: Blitz-Symbol im Batteriegehaeuse (weisse Fuellung,
+// schwarze Kontur) statt links daneben.
+// ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
