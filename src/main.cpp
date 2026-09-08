@@ -12,6 +12,10 @@
 //   NOCH NICHT AUF HARDWARE UEBER EINEN VOLLEN TAG VERIFIZIERT - besonders
 //   der Tageswechsel um Mitternacht und das 14-Uhr-Fenster verdienen
 //   Beobachtung.
+// - Kurzer Tastendruck (KeyHoldResult::SHORT_PRESS) erzwingt jetzt einen
+//   sofortigen Preisabruf unabhaengig vom Zeitfenster - war durch die
+//   Abruf-Entkopplung oben sonst unmoeglich (manueller Refresh ausserhalb
+//   der beiden taeglichen Fenster).
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -96,7 +100,7 @@ struct PriceAssessment {
   int nextCheapInHours = -1, currentCheapRemainingHours = -1;
 };
 
-enum class KeyHoldResult { NONE, MAINTENANCE_TOGGLE, FACTORY_RESET };
+enum class KeyHoldResult { NONE, SHORT_PRESS, MAINTENANCE_TOGGLE, FACTORY_RESET };
 
 struct BatteryStatus {
   bool valid = false;
@@ -676,7 +680,7 @@ KeyHoldResult readKeyHold() {
   }
   uint32_t held = millis() - start;
   if (held >= 3000) return KeyHoldResult::MAINTENANCE_TOGGLE;
-  return KeyHoldResult::NONE;
+  return KeyHoldResult::SHORT_PRESS;
 }
 String suffix() { uint64_t mac=ESP.getEfuseMac(); char b[7]; snprintf(b,sizeof(b),"%06llX",mac&0xFFFFFFULL); return b; }
 
@@ -788,9 +792,13 @@ void setup() {
       storage.saveMaintenanceMode(maintenanceMode);
       Serial.println(maintenanceMode ? "Wartungsmodus aktiviert." : "Wartungsmodus deaktiviert.");
       break;
+    case KeyHoldResult::SHORT_PRESS:
+      Serial.println("Kurzer Tastendruck: erzwinge Preisabruf unabhaengig vom Zeitfenster.");
+      break;
     case KeyHoldResult::NONE:
       break;
   }
+  const bool manualRefresh = keyHold == KeyHoldResult::SHORT_PRESS;
   RuntimeConfig cfg;
   if (!storage.loadConfig(cfg)) {
     String ap = String(AppConfig::AP_PREFIX) + suffix(), pw = String(AppConfig::AP_PASSWORD_PREFIX) + suffix();
@@ -829,7 +837,7 @@ void setup() {
   const bool needTomorrow = nowValid && tomorrowCachedDateNow != tomorrowWantedDate;
   struct tm nowLocal = {}; if (nowValid) localtime_r(&now, &nowLocal);
   const bool tomorrowWindowOpen = nowValid && nowLocal.tm_hour >= AppConfig::TOMORROW_FETCH_HOUR;
-  const bool shouldConnect = needToday || (needTomorrow && tomorrowWindowOpen);
+  const bool shouldConnect = needToday || (needTomorrow && tomorrowWindowOpen) || manualRefresh;
 
   if (shouldConnect) {
     TibberConnection network(storage);
