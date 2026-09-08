@@ -730,6 +730,14 @@ BatteryStatus readBatteryStatus() {
   if (axpReadRegister(0x01, status)) {
     uint8_t direction = (status >> 5) & 0x03; // Bits 6-5
     b.charging = (direction == 0x01);
+    // Diagnose: Lade-Bitinterpretation stammt aus dem urspruenglichen Handoff
+    // und wurde nie auf echter Hardware verifiziert. Rohwert + alle Bits
+    // mitloggen, um die tatsaechliche Bitbelegung beim Laden pruefen zu koennen.
+    Serial.printf("AXP2101 Reg 0x01=0x%02X Bits[7..0]=%d%d%d%d%d%d%d%d direction(Bits6-5)=%u charging=%d\n",
+                  status,
+                  (status >> 7) & 1, (status >> 6) & 1, (status >> 5) & 1, (status >> 4) & 1,
+                  (status >> 3) & 1, (status >> 2) & 1, (status >> 1) & 1, status & 1,
+                  direction, b.charging ? 1 : 0);
   }
   return b;
 }
