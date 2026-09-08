@@ -843,6 +843,10 @@ void setup() {
       network.off();
     } else if (needToday) {
       snapshot.isStale = true; snapshot.staleReason = "wifi";
+    } else {
+      // WLAN-Verbindung fuer den Nachmittagsabruf fehlgeschlagen, "heute"
+      // ist aber weiterhin gueltig - bisher lief das komplett unbemerkt durch.
+      Serial.println("WLAN fuer Morgen-Abruf nicht erreichbar, naechster Versuch in einer Stunde.");
     }
   }
 
