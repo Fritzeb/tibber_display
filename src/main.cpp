@@ -848,8 +848,15 @@ void setup() {
 
   cached = !snapshot.today.empty();
   if (cached) {
-    const String finalTodayDate = localDateString(parseIso(snapshot.today[0].startsAt));
-    snapshot.isStale = !nowValid || finalTodayDate != todayDate;
+    // Wichtig: Zeit hier NEU auswerten, nicht die "nowValid"/"todayDate" von
+    // oben wiederverwenden - falls die Uhr erst durch den NTP-Sync in diesem
+    // Zyklus gueltig wurde, waere der alte Stand faelschlich noch "ungueltig"
+    // und wuerde trotz frisch geholter Preise OFFLINE anzeigen.
+    const time_t finalNow = time(nullptr);
+    const bool finalNowValid = finalNow >= 1700000000;
+    const String finalTodayDate = finalNowValid ? localDateString(finalNow) : "";
+    const String cachedTodayDate = localDateString(parseIso(snapshot.today[0].startsAt));
+    snapshot.isStale = !finalNowValid || cachedTodayDate != finalTodayDate;
     if (!snapshot.isStale) snapshot.staleReason = "";
     else if (snapshot.staleReason.isEmpty()) snapshot.staleReason = failure.isEmpty() ? "wifi" : failure;
     snapshot.currentIndex = computeCurrentIndex(snapshot);
