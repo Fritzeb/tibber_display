@@ -475,7 +475,9 @@ class DisplayDriver {
       const String updateText = "LETZTES UPDATE: " + localTime(s.fetchedAt) + (s.isStale ? " (OFFLINE)" : "");
       display.setCursor(400, 466); display.print(updateText);
       if (battery.valid) {
-        const int bx = 711, bw = 25, bh = 14, by = 466 - bh;
+        // Rechtsbuendig mit dem Diagrammende (chartX + chartW = 56 + 710 = 766),
+        // Pluspol-Nase (2px) mit eingerechnet.
+        const int bx = 739, bw = 25, bh = 14, by = 466 - bh;
         display.drawRect(bx, by, bw, bh, GxEPD_BLACK);
         display.drawRect(bx + bw, by + 3, 2, bh - 6, GxEPD_BLACK); // Pluspol-Nase
         uint16_t fillColor = battery.percent >= 50 ? GxEPD_GREEN
