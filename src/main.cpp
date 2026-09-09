@@ -397,7 +397,12 @@ class DisplayDriver {
       };
 
       display.drawRect(chartX, chartY, chartW, chartH, GxEPD_BLACK);
-      const float chartMaxCt = std::max(1.0F, maxCt * 1.15F);
+      // Skalierung ueber ALLE sichtbaren Balken (heute+morgen), nicht nur
+      // ueber maxCt (heute) - sonst ragen morgige Balken ueber den oberen
+      // Rand hinaus, wenn sie teurer als der teuerste heutige Preis sind.
+      float chartMaxSourceCt = maxCt;
+      for (const auto &p : points) chartMaxSourceCt = std::max(chartMaxSourceCt, p.totalEurPerKwh * 100.0F);
+      const float chartMaxCt = std::max(1.0F, chartMaxSourceCt * 1.15F);
 
       // Nine positions produce eight equal value bands. Every other position is a labelled main mark.
       display.setFont(&FreeMonoBold9pt7b);
