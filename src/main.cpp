@@ -765,18 +765,26 @@ Storage storage;
 DisplayDriver display;
 
 void setup() {
+  pinMode(SYS_OUT_LATCH, OUTPUT);
+  digitalWrite(SYS_OUT_LATCH, HIGH);
+
+  // Taster so frueh wie moeglich abfragen, direkt nach der einen GPIO-Aktion,
+  // die zwingend zuerst kommen muss. readKeyHold() wurde bisher erst nach
+  // Serial/Wire/AXP2101-Init (mehrere I2C-Zugriffe + delay(10)) aufgerufen -
+  // bei einem schnellen kurzen Tastendruck war die Taste bis dahin oft schon
+  // wieder losgelassen, das Ergebnis faelschlich NONE statt SHORT_PRESS.
+  pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+  const KeyHoldResult keyHold = readKeyHold();
+
   // Kein delay() nach Serial.begin(): im Batteriebetrieb haengt kein Rechner
   // am USB-Port, jede Wartezeit hier kostet nur unnoetig Strom bei jedem der
   // 24 Wakes/Tag. Native USB-CDC muss nicht "anlaufen" wie klassisches UART.
   Serial.begin(115200);
 
-  pinMode(SYS_OUT_LATCH, OUTPUT);
-  digitalWrite(SYS_OUT_LATCH, HIGH);
-
   const esp_reset_reason_t resetReason = esp_reset_reason();
   const esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
 
-  setenv("TZ", AppConfig::TIMEZONE, 1); tzset(); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+  setenv("TZ", AppConfig::TIMEZONE, 1); tzset();
   Wire.begin(PMIC_SDA, PMIC_SCL);
   Wire.setTimeOut(50);
 
@@ -786,7 +794,6 @@ void setup() {
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) esp_bt_controller_disable();
 
   bool maintenanceMode = storage.loadMaintenanceMode();
-  const KeyHoldResult keyHold = readKeyHold();
 
   // Spontan-Wakeup: das Geraet ist per EXT0 (Taste) aufgewacht, aber es liegt
   // kein echter Tastendruck vor. Deutet auf einen Floating-Pin waehrend des
