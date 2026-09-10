@@ -16,6 +16,10 @@
 //   sofortigen Preisabruf unabhaengig vom Zeitfenster - war durch die
 //   Abruf-Entkopplung oben sonst unmoeglich (manueller Refresh ausserhalb
 //   der beiden taeglichen Fenster).
+// - Nachtpause auf 00:00-05:00 erweitert (vorher 01:00-05:00): kein
+//   automatischer Wake mehr zwischen Mitternacht und 5 Uhr. Der
+//   Tageswechsel (Cache-Promotion) passiert dadurch erst beim 05:01-Wake,
+//   kostet aber kein WLAN (siehe AppConfig::NIGHT_PAUSE_FIRST_HOUR).
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -139,8 +143,12 @@ constexpr uint32_t PORTAL_TIMEOUT_MS = 15UL * 60UL * 1000UL;
 constexpr uint32_t FACTORY_RESET_HOLD_MS = 15000;
 constexpr uint32_t UPDATE_OFFSET_SECONDS = 90;
 constexpr uint16_t NETWORK_UPDATE_MINUTES = 60;
-// Save battery overnight: fetch at 00:01, then pause automatic network updates until 05:01.
-constexpr uint8_t NIGHT_PAUSE_FIRST_HOUR = 1;
+// Save battery overnight: kein automatischer Wake zwischen 00:00 und 05:00,
+// letzter Wake vor Mitternacht ist der um 23:01, naechster dann 05:01. Der
+// Tageswechsel (Cache-Promotion, siehe setup()) passiert dadurch erst beim
+// 05:01-Wake statt separat um 00:01 - kostet aber kein WLAN, da die
+// Uebernahme von "morgen" zu "heute" rein lokal ist.
+constexpr uint8_t NIGHT_PAUSE_FIRST_HOUR = 0;
 constexpr uint8_t NIGHT_PAUSE_RESUME_HOUR = 5;
 constexpr uint32_t NTP_SYNC_INTERVAL_SECONDS = 12UL * 60UL * 60UL;
 // Tibber-Tagespreise aendern sich nach Veroeffentlichung nicht mehr - ein
@@ -649,8 +657,8 @@ uint32_t nextSleepSeconds() {
   const uint32_t period = AppConfig::NETWORK_UPDATE_MINUTES * 60UL;
   time_t nextWake = now + period - (now % period) + AppConfig::UPDATE_OFFSET_SECONDS;
 
-  // The normal next wake after the 00:01 update would be 01:01. Skip all
-  // automatic wakes from 01:00 through 04:59 and resume at 05:01:30 local time.
+  // Letzter regulaerer Wake vor Mitternacht ist 23:01. Skip alle
+  // automatischen Wakes von 00:00 bis 04:59, naechster Wake ist 05:01:30.
   struct tm local;
   localtime_r(&nextWake, &local);
   if (local.tm_hour >= AppConfig::NIGHT_PAUSE_FIRST_HOUR &&
