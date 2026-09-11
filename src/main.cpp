@@ -1,25 +1,23 @@
 // ============================================================================
 // VERSION: BETA - basiert auf v1.0.0 (stable)
 // Branch: experimente
-// Aktuelle Experimente:
-// - Blitz-Symbol im Batteriegehaeuse (weisse Fuellung, schwarze Kontur)
-//   statt links daneben.
-// - Tibber wird nicht mehr stuendlich kontaktiert, nur noch einmal fuer den
-//   neuen Tag und einmal nachmittags (AppConfig::TOMORROW_FETCH_HOUR) fuer
-//   die Morgen-Preise. Alle anderen stuendlichen Wakes zeichnen nur aus dem
-//   Cache neu. today+tomorrow werden dafuer beide kompakt in NVS gecacht
-//   (Storage::loadDayArray/saveDayArray) statt wie bisher nur today als JSON.
-//   NOCH NICHT AUF HARDWARE UEBER EINEN VOLLEN TAG VERIFIZIERT - besonders
-//   der Tageswechsel um Mitternacht und das 14-Uhr-Fenster verdienen
-//   Beobachtung.
-// - Kurzer Tastendruck (KeyHoldResult::SHORT_PRESS) erzwingt jetzt einen
-//   sofortigen Preisabruf unabhaengig vom Zeitfenster - war durch die
-//   Abruf-Entkopplung oben sonst unmoeglich (manueller Refresh ausserhalb
-//   der beiden taeglichen Fenster).
-// - Nachtpause auf 00:00-05:00 erweitert (vorher 01:00-05:00): kein
-//   automatischer Wake mehr zwischen Mitternacht und 5 Uhr. Der
-//   Tageswechsel (Cache-Promotion) passiert dadurch erst beim 05:01-Wake,
-//   kostet aber kein WLAN (siehe AppConfig::NIGHT_PAUSE_FIRST_HOUR).
+//
+// Auf Hardware ueber mehrere Tage bestaetigt (Stand 11.09.):
+// - Blitz-Symbol im Batteriegehaeuse (weisse Fuellung, schwarze Kontur).
+// - Abruf-Entkopplung: Tibber nur noch 2x/Tag (neuer Tag + Nachmittag fuer
+//   Morgen-Preise) statt stuendlich, today+tomorrow kompakt in NVS gecacht.
+//   Mitternachts-Tageswechsel (Cache-Promotion ohne WLAN) verifiziert.
+// - Kurzer Tastendruck erzwingt sofortigen Preisabruf unabhaengig vom
+//   Zeitfenster (KeyHoldResult::SHORT_PRESS), inkl. Fix fuer eine
+//   Race-Condition beim fruehen Tasten-Auslesen.
+// - Nachtpause auf 00:00-05:00 erweitert.
+// - Batterielaufzeit im Normalbetrieb ca. 5,7%/Tag (~17 Tage bei reinem
+//   Akkubetrieb ohne Solar).
+//
+// Neu, noch nicht auf Hardware verifiziert:
+// - Diagramm-Achsen: Y-Achse auf runde Schritte (5/10/20/25/50 ct) statt
+//   krummer Achtel-Bruchteile umgestellt, X-Achse-Beschriftung im
+//   24h-Modus auf alle 2h verdichtet (vorher fix alle 3h).
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
