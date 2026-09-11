@@ -16,8 +16,9 @@
 //
 // Neu, noch nicht auf Hardware verifiziert:
 // - Diagramm-Achsen: Y-Achse auf runde Schritte (5/10/20/25/50 ct) statt
-//   krummer Achtel-Bruchteile umgestellt, X-Achse-Beschriftung im
-//   24h-Modus auf alle 2h verdichtet (vorher fix alle 3h).
+//   krummer Achtel-Bruchteile umgestellt. X-Achse jetzt mit konstantem
+//   Pixelabstand pro Label: 24h-Modus stuendlich, 48h-Modus alle 2h
+//   (vorher fix alle 3h in beiden Faellen).
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
