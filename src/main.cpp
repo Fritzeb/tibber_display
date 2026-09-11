@@ -16,9 +16,12 @@
 //
 // Neu, noch nicht auf Hardware verifiziert:
 // - Diagramm-Achsen: Y-Achse auf runde Schritte (5/10/20/25/50 ct) statt
-//   krummer Achtel-Bruchteile umgestellt. X-Achse jetzt mit konstantem
-//   Pixelabstand pro Label: 24h-Modus stuendlich, 48h-Modus alle 2h
-//   (vorher fix alle 3h in beiden Faellen).
+//   krummer Achtel-Bruchteile umgestellt (Rundung auf den naechsten, nicht
+//   den naechsthoeheren "nice"-Wert - eine erste Version rundete zu grob
+//   auf, z.B. 54,1ct Max ergab Achse bis 80 statt bis 60; jetzt behoben,
+//   siehe niceAxisStep in DisplayDriver::render()). X-Achse jetzt mit
+//   konstantem Pixelabstand pro Label: 24h-Modus stuendlich, 48h-Modus
+//   alle 2h (vorher fix alle 3h in beiden Faellen).
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
