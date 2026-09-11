@@ -409,22 +409,26 @@ class DisplayDriver {
       // Rand hinaus, wenn sie teurer als der teuerste heutige Preis sind.
       float chartMaxSourceCt = maxCt;
       for (const auto &p : points) chartMaxSourceCt = std::max(chartMaxSourceCt, p.totalEurPerKwh * 100.0F);
-      const float chartMaxCt = std::max(1.0F, chartMaxSourceCt * 1.15F);
+      const float chartMaxCt = std::max(1.0F, chartMaxSourceCt);
 
       // Runde Achsenschritte (5/10/20/25/50 ...) statt gleicher Achtel-Bruchteile
       // von chartMaxCt - vorher standen dort z.B. 11/23/35/47, kaum ablesbar.
-      // Ziel: ca. 6 Linien, alle beschriftet. Die Balkenskala wird dafuer auf
-      // das naechste Vielfache des Schritts aufgerundet (axisTopCt), damit
-      // Gitterlinien und Balkenhoehen konsistent bleiben.
+      // Ziel: ca. 6 Linien, alle beschriftet. Rundung auf den NAECHSTEN nicht
+      // den NAECHSTHOEHEREN Wert (Heckberts "nice numbers"), sonst springt die
+      // Skala schon bei knapp ueber der Schwelle eine ganze Stufe zu weit
+      // (z.B. 62 -> 80 statt 62 -> 60/70). Kein zusaetzlicher 15%-Puffer mehr -
+      // das Aufrunden auf die naechste Rasterlinie liefert von selbst genug
+      // Abstand zwischen hoechstem Balken und Diagrammoberkante.
       auto niceAxisStep = [](float roughStep) {
         if (roughStep <= 0) return 1.0F;
         const float magnitude = powf(10.0F, floorf(log10f(roughStep)));
-        const float residual = roughStep / magnitude;
-        float niceResidual = 1.0F;
-        if (residual > 5.0F) niceResidual = 10.0F;
-        else if (residual > 2.0F) niceResidual = 5.0F;
-        else if (residual > 1.0F) niceResidual = 2.0F;
-        return niceResidual * magnitude;
+        const float fraction = roughStep / magnitude;
+        float niceFraction;
+        if (fraction < 1.5F) niceFraction = 1.0F;
+        else if (fraction < 3.0F) niceFraction = 2.0F;
+        else if (fraction < 7.0F) niceFraction = 5.0F;
+        else niceFraction = 10.0F;
+        return niceFraction * magnitude;
       };
       const float axisStepCt = niceAxisStep(chartMaxCt / 6.0F);
       const int axisTickCount = static_cast<int>(ceilf(chartMaxCt / axisStepCt));
