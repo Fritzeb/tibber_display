@@ -447,10 +447,14 @@ class DisplayDriver {
       }
 
       // Ticks are derived from the actual local start time of every interval, not from its array index.
-      // Alle 2h beschriften, sowohl im 24h- als auch im 48h-Modus - im
-      // 48h-Modus sind die Balken zwar schmaler, aber der Pixelabstand pro
-      // Label bleibt durch die doppelte Anzahl Balken etwa gleich.
-      const int hourLabelStep = 2;
+      // Ziel: immer ca. 24 Labels ueber die volle Breite, unabhaengig davon
+      // ob 24h oder 48h sichtbar sind - im 24h-Modus daher stuendlich, im
+      // 48h-Modus alle 2h (gleicher Pixelabstand pro Label in beiden
+      // Faellen). Skaliert automatisch mit, falls Tibber irgendwann
+      // 15-Minuten-Preise liefert (dann waeren es entsprechend mehr Balken
+      // pro Stunde, die Formel haelt den Stunden-Abstand trotzdem bei ~1h/2h).
+      const float hoursSpan = n * s.intervalMinutes / 60.0F;
+      const int hourLabelStep = std::max(1, static_cast<int>(std::round(hoursSpan / 24.0F)));
       display.setFont(&FreeMonoBold9pt7b); display.setTextColor(GxEPD_BLACK);
       for (int i = 0; i < n; ++i) {
         time_t starts = parseIso(points[i].startsAt);
