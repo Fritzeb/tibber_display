@@ -447,11 +447,10 @@ class DisplayDriver {
       }
 
       // Ticks are derived from the actual local start time of every interval, not from its array index.
-      // Label-Dichte an die sichtbare Zeitspanne anpassen: im 24h-Modus (vor
-      // dem Nachmittagsabruf) ist pro Balken doppelt so viel Platz wie im
-      // 48h-Modus - alle 3h beschriften war dort unnoetig sparsam.
-      const float hoursSpan = n * s.intervalMinutes / 60.0F;
-      const int hourLabelStep = hoursSpan <= 24.0F ? 2 : 3;
+      // Alle 2h beschriften, sowohl im 24h- als auch im 48h-Modus - im
+      // 48h-Modus sind die Balken zwar schmaler, aber der Pixelabstand pro
+      // Label bleibt durch die doppelte Anzahl Balken etwa gleich.
+      const int hourLabelStep = 2;
       display.setFont(&FreeMonoBold9pt7b); display.setTextColor(GxEPD_BLACK);
       for (int i = 0; i < n; ++i) {
         time_t starts = parseIso(points[i].startsAt);
