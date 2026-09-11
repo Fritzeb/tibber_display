@@ -1,6 +1,27 @@
 // ============================================================================
-// VERSION: v1.0.0 (STABLE) - auf echter Hardware getestet
+// VERSION: v1.1.0 (STABLE) - auf echter Hardware ueber mehrere Tage getestet
 // Branch: main
+//
+// Neu seit v1.0.0:
+// - Blitz-Symbol im Batteriegehaeuse (weisse Fuellung, schwarze Kontur)
+//   statt links daneben.
+// - Abruf-Entkopplung: Tibber nur noch 2x/Tag kontaktiert (neuer Tag +
+//   Nachmittag fuer Morgen-Preise) statt stuendlich. Alle anderen
+//   stuendlichen Wakes zeichnen nur aus dem Cache neu. today+tomorrow
+//   werden dafuer beide kompakt in NVS gecacht (Storage::loadDayArray/
+//   saveDayArray). Mitternachts-Tageswechsel (Cache-Promotion ohne WLAN)
+//   auf Hardware verifiziert.
+// - Kurzer Tastendruck erzwingt sofortigen Preisabruf unabhaengig vom
+//   Zeitfenster (KeyHoldResult::SHORT_PRESS), inkl. Fix fuer eine
+//   Race-Condition beim fruehen Tasten-Auslesen (Taster wird jetzt vor
+//   Serial/Wire/AXP2101-Init abgefragt).
+// - Nachtpause auf 00:00-05:00 erweitert (vorher 01:00-05:00).
+// - Diagramm-Achsen ueberarbeitet: Y-Achse auf runde Schritte (5/10/20/
+//   25/50 ct) statt krummer Achtel-Bruchteile, X-Achse mit konstantem
+//   Pixelabstand pro Label (24h-Modus stuendlich, 48h-Modus alle 2h,
+//   vorher fix alle 3h in beiden Faellen).
+// - Batterielaufzeit im Normalbetrieb ca. 5,7%/Tag (~17 Tage bei reinem
+//   Akkubetrieb ohne Solar) - deutliche Verbesserung ggue. v1.0.0.
 // ============================================================================
 #include <Arduino.h>
 #include <WiFi.h>
@@ -85,7 +106,7 @@ struct PriceAssessment {
   int nextCheapInHours = -1, currentCheapRemainingHours = -1;
 };
 
-enum class KeyHoldResult { NONE, MAINTENANCE_TOGGLE, FACTORY_RESET };
+enum class KeyHoldResult { NONE, SHORT_PRESS, MAINTENANCE_TOGGLE, FACTORY_RESET };
 
 struct BatteryStatus {
   bool valid = false;
@@ -108,7 +129,10 @@ void initAxp2101();
 time_t parseIso(const String &s);
 String localTime(const String &s);
 String isoNow();
+String formatIsoLocal(time_t t);
+String localDateString(time_t t);
 PriceAssessment assess(const PriceSnapshot &s);
+int computeCurrentIndex(const PriceSnapshot &s);
 uint32_t nextSleepSeconds();
 void sleepFor(uint32_t seconds, bool enableTimerWakeup = true);
 String suffix();
@@ -121,10 +145,22 @@ constexpr uint32_t PORTAL_TIMEOUT_MS = 15UL * 60UL * 1000UL;
 constexpr uint32_t FACTORY_RESET_HOLD_MS = 15000;
 constexpr uint32_t UPDATE_OFFSET_SECONDS = 90;
 constexpr uint16_t NETWORK_UPDATE_MINUTES = 60;
-// Save battery overnight: fetch at 00:01, then pause automatic network updates until 05:01.
-constexpr uint8_t NIGHT_PAUSE_FIRST_HOUR = 1;
+// Save battery overnight: kein automatischer Wake zwischen 00:00 und 05:00,
+// letzter Wake vor Mitternacht ist der um 23:01, naechster dann 05:01. Der
+// Tageswechsel (Cache-Promotion, siehe setup()) passiert dadurch erst beim
+// 05:01-Wake statt separat um 00:01 - kostet aber kein WLAN, da die
+// Uebernahme von "morgen" zu "heute" rein lokal ist.
+constexpr uint8_t NIGHT_PAUSE_FIRST_HOUR = 0;
 constexpr uint8_t NIGHT_PAUSE_RESUME_HOUR = 5;
 constexpr uint32_t NTP_SYNC_INTERVAL_SECONDS = 12UL * 60UL * 60UL;
+// Tibber-Tagespreise aendern sich nach Veroeffentlichung nicht mehr - ein
+// staendliches Neuverbinden ist daher fast immer verschwendete Batterie.
+// Tibber kontaktieren wir nur noch: einmal fuer den neuen Tag (falls die
+// Vorschau vom Vortag fehlt) und einmal ab dieser Uhrzeit fuer die
+// Morgen-Preise (Day-Ahead-Auktion ist ueblicherweise ab dem fruehen
+// Nachmittag veroeffentlicht). Alle anderen stuendlichen Wakes zeichnen nur
+// aus dem Cache neu (JETZT-Balken, Batterie, Tasten) - kein WLAN noetig.
+constexpr uint8_t TOMORROW_FETCH_HOUR = 14;
 constexpr uint8_t CHEAP_PERCENTILE = 25;
 constexpr uint8_t EXPENSIVE_PERCENTILE = 75;
 constexpr float VERY_EXPENSIVE_CT = 40.0F;
@@ -154,25 +190,41 @@ class Storage {
     p.remove("home"); p.end(); return ok;
   }
   void eraseConfigAndSnapshot() { Preferences p; if (p.begin("pricecfg", false)) { p.clear(); p.end(); } if (p.begin("tibber", false)) { p.clear(); p.end(); } }
+  // Kompaktes Binaerformat statt JSON: nur Startzeit + Intervall + rohes
+  // Float-Array pro Tag, keine wiederholten ISO-Zeitstempel-Strings. Bei
+  // 24 Punkten heute+morgen ~200 Byte statt ~3500 Byte JSON - haelt auch bei
+  // 15-Minuten-Aufloesung (96 Punkte/Tag) sicher Abstand vom NVS-Platzlimit,
+  // das hier schon einmal zuschlug (siehe Kommentar in der alten Version).
   bool loadSnapshot(PriceSnapshot &s) {
-    Preferences p; if (!p.begin("tibber", true) || !p.isKey("json")) return false;
-    String raw = p.getString("json", ""); p.end(); JsonDocument d; if (deserializeJson(d, raw)) return false;
-    s.fetchedAt = d["fetchedAt"] | ""; s.homeId = d["homeId"] | ""; s.intervalMinutes = d["interval"] | 60; s.currentIndex = d["currentIndex"] | -1; s.isStale = true; s.staleReason = "offline";
-    for (JsonObject x : d["today"].as<JsonArray>()) s.today.push_back({x["startsAt"] | "", x["total"] | 0.0F, x["currency"] | "EUR"});
+    Preferences p; if (!p.begin("tibber", true)) return false;
+    if (!p.isKey("tCnt")) { p.end(); return false; }
+    s.homeId = p.getString("homeId", "");
+    s.intervalMinutes = p.getUShort("ivalMin", 60);
+    String currency = p.getString("curr", "EUR");
+    s.fetchedAt = p.getString("fetchedAt", "");
+    loadDayArray(p, "t", s.intervalMinutes, currency, s.today);
+    loadDayArray(p, "m", s.intervalMinutes, currency, s.tomorrow);
+    s.isStale = true; s.staleReason = "offline";
+    p.end();
     return !s.today.empty();
   }
   bool saveSnapshot(const PriceSnapshot &s) {
-    JsonDocument d; d["fetchedAt"] = s.fetchedAt; d["homeId"] = s.homeId; d["interval"] = s.intervalMinutes; d["currentIndex"] = s.currentIndex;
-    JsonArray t = d["today"].to<JsonArray>();
-    for (const auto &x : s.today) { JsonObject o = t.add<JsonObject>(); o["startsAt"] = x.startsAt; o["total"] = x.totalEurPerKwh; o["currency"] = x.currency; }
-    String raw; serializeJson(d, raw);
     Preferences p; if (!p.begin("tibber", false)) return false;
-    bool ok = p.putString("json", raw) > 0;
+    String currency = s.today.empty() ? String("EUR") : s.today[0].currency;
+    auto writeAll = [&]() {
+      p.putString("homeId", s.homeId);
+      p.putUShort("ivalMin", s.intervalMinutes);
+      p.putString("curr", currency);
+      p.putString("fetchedAt", s.fetchedAt);
+      return saveDayArray(p, "t", s.today) && saveDayArray(p, "m", s.tomorrow);
+    };
+    bool ok = writeAll();
     if (!ok) {
       // Vermutliche NVS-Fragmentierung nach vielen Schreibvorgaengen:
-      // Namespace einmalig leeren und erneut versuchen.
+      // Namespace einmalig leeren und erneut versuchen. Loescht dabei auch
+      // WLAN-Hint und NTP-Sync-Zeitstempel im selben Namespace mit.
       p.clear();
-      ok = p.putString("json", raw) > 0;
+      ok = writeAll();
       Serial.println(ok ? "Preis-Cache nach NVS-Bereinigung gespeichert."
                          : "Preis-Cache weiterhin nicht speicherbar.");
     }
@@ -211,15 +263,48 @@ class Storage {
     Preferences p; if (p.begin("tibber", false)) { p.putBytes("wifiBssid", bssid, 6); p.putInt("wifiChan", channel); p.end(); }
   }
   bool snapshotHasSamePrices(const PriceSnapshot &a, const PriceSnapshot &b) {
-    if (a.homeId != b.homeId || a.intervalMinutes != b.intervalMinutes || a.currentIndex != b.currentIndex || a.today.size() != b.today.size() || a.tomorrow.size() != b.tomorrow.size()) return false;
+    if (a.homeId != b.homeId || a.intervalMinutes != b.intervalMinutes || a.today.size() != b.today.size() || a.tomorrow.size() != b.tomorrow.size()) return false;
     auto same = [](const std::vector<PricePoint> &x, const std::vector<PricePoint> &y) { for (size_t i = 0; i < x.size(); ++i) if (x[i].startsAt != y[i].startsAt || x[i].totalEurPerKwh != y[i].totalEurPerKwh || x[i].currency != y[i].currency) return false; return true; };
     return same(a.today, b.today) && same(a.tomorrow, b.tomorrow);
+  }
+
+ private:
+  static bool loadDayArray(Preferences &p, const char *prefix, uint16_t intervalMinutes, const String &currency, std::vector<PricePoint> &out) {
+    out.clear();
+    uint16_t count = p.getUShort((String(prefix) + "Cnt").c_str(), 0);
+    if (count == 0) return true;
+    int64_t start = p.getLong64((String(prefix) + "Start").c_str(), 0);
+    if (start <= 0) return true;
+    std::vector<float> prices(count);
+    size_t got = p.getBytes((String(prefix) + "Px").c_str(), prices.data(), count * sizeof(float));
+    if (got != count * sizeof(float)) return true;
+    out.reserve(count);
+    for (uint16_t i = 0; i < count; ++i) {
+      time_t pointTime = static_cast<time_t>(start) + static_cast<time_t>(i) * intervalMinutes * 60;
+      out.push_back(PricePoint(formatIsoLocal(pointTime), prices[i], currency));
+    }
+    return true;
+  }
+  static bool saveDayArray(Preferences &p, const char *prefix, const std::vector<PricePoint> &points) {
+    if (points.empty()) { p.putUShort((String(prefix) + "Cnt").c_str(), 0); return true; }
+    time_t start = parseIso(points[0].startsAt);
+    if (start <= 0) { p.putUShort((String(prefix) + "Cnt").c_str(), 0); return false; }
+    std::vector<float> prices; prices.reserve(points.size());
+    for (const auto &pt : points) prices.push_back(pt.totalEurPerKwh);
+    bool ok = p.putLong64((String(prefix) + "Start").c_str(), static_cast<int64_t>(start)) > 0;
+    ok = ok && p.putBytes((String(prefix) + "Px").c_str(), prices.data(), prices.size() * sizeof(float)) > 0;
+    ok = ok && p.putUShort((String(prefix) + "Cnt").c_str(), static_cast<uint16_t>(points.size())) > 0;
+    return ok;
   }
 };
 
 time_t parseIso(const String &s) { struct tm t = {}; if (!strptime(s.c_str(), "%Y-%m-%dT%H:%M:%S", &t)) return 0; t.tm_isdst = -1; return mktime(&t); }
 String localTime(const String &s) { time_t v = parseIso(s); if (v <= 0) return "?"; struct tm t; localtime_r(&v, &t); char b[8]; strftime(b, sizeof(b), "%H:%M", &t); return b; }
-String isoNow() { time_t n = time(nullptr); struct tm t; localtime_r(&n, &t); char b[32]; strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%S%z", &t); return b; }
+String formatIsoLocal(time_t t) { struct tm tv; localtime_r(&t, &tv); char b[32]; strftime(b, sizeof(b), "%Y-%m-%dT%H:%M:%S%z", &tv); return b; }
+String isoNow() { return formatIsoLocal(time(nullptr)); }
+// Kalendertag (lokal) als Vergleichsschluessel - fuer die Entscheidung, ob
+// der Preis-Cache noch zum aktuellen bzw. naechsten Tag passt.
+String localDateString(time_t t) { struct tm tv; localtime_r(&t, &tv); char b[11]; strftime(b, sizeof(b), "%Y-%m-%d", &tv); return b; }
 
 class DisplayDriver {
   GxEPD2_7C<GxEPD2_730c_GDEP073E01, GxEPD2_730c_GDEP073E01::HEIGHT / 2> display;
@@ -322,24 +407,47 @@ class DisplayDriver {
       };
 
       display.drawRect(chartX, chartY, chartW, chartH, GxEPD_BLACK);
-      const float chartMaxCt = std::max(1.0F, maxCt * 1.15F);
+      // Skalierung ueber ALLE sichtbaren Balken (heute+morgen), nicht nur
+      // ueber maxCt (heute) - sonst ragen morgige Balken ueber den oberen
+      // Rand hinaus, wenn sie teurer als der teuerste heutige Preis sind.
+      float chartMaxSourceCt = maxCt;
+      for (const auto &p : points) chartMaxSourceCt = std::max(chartMaxSourceCt, p.totalEurPerKwh * 100.0F);
+      const float chartMaxCt = std::max(1.0F, chartMaxSourceCt);
 
-      // Nine positions produce eight equal value bands. Every other position is a labelled main mark.
+      // Runde Achsenschritte (5/10/20/25/50 ...) statt gleicher Achtel-Bruchteile
+      // von chartMaxCt - vorher standen dort z.B. 11/23/35/47, kaum ablesbar.
+      // Ziel: ca. 6 Linien, alle beschriftet. Rundung auf den NAECHSTEN nicht
+      // den NAECHSTHOEHEREN Wert (Heckberts "nice numbers"), sonst springt die
+      // Skala schon bei knapp ueber der Schwelle eine ganze Stufe zu weit
+      // (z.B. 62 -> 80 statt 62 -> 60/70). Kein zusaetzlicher 15%-Puffer mehr -
+      // das Aufrunden auf die naechste Rasterlinie liefert von selbst genug
+      // Abstand zwischen hoechstem Balken und Diagrammoberkante.
+      auto niceAxisStep = [](float roughStep) {
+        if (roughStep <= 0) return 1.0F;
+        const float magnitude = powf(10.0F, floorf(log10f(roughStep)));
+        const float fraction = roughStep / magnitude;
+        float niceFraction;
+        if (fraction < 1.5F) niceFraction = 1.0F;
+        else if (fraction < 3.0F) niceFraction = 2.0F;
+        else if (fraction < 7.0F) niceFraction = 5.0F;
+        else niceFraction = 10.0F;
+        return niceFraction * magnitude;
+      };
+      const float axisStepCt = niceAxisStep(chartMaxCt / 6.0F);
+      const int axisTickCount = static_cast<int>(ceilf(chartMaxCt / axisStepCt));
+      const float axisTopCt = axisTickCount * axisStepCt;
+
       display.setFont(&FreeMonoBold9pt7b);
-      for (int division = 0; division <= 8; ++division) {
-        const int y = chartY + chartH - (division * chartH) / 8;
-        const float value = chartMaxCt * division / 8.0F;
-        if ((division % 2) == 0) {
-          display.drawLine(chartX + 1, y, chartX + chartW - 2, y, GxEPD_BLACK);
-          rightAligned(String(static_cast<int>(roundf(value))), 52, y + 4);
-        } else {
-          display.drawLine(chartX - 4, y, chartX, y, GxEPD_BLACK);
-        }
+      for (int tick = 0; tick <= axisTickCount; ++tick) {
+        const float value = tick * axisStepCt;
+        const int y = chartY + chartH - static_cast<int>((value / axisTopCt) * chartH);
+        display.drawLine(chartX + 1, y, chartX + chartW - 2, y, GxEPD_BLACK);
+        rightAligned(String(static_cast<int>(roundf(value))), 52, y + 4);
       }
 
       for (int i = 0; i < n; ++i) {
         const float ct = points[i].totalEurPerKwh * 100.0F;
-        const int h = static_cast<int>((chartH - 2) * ct / chartMaxCt);
+        const int h = static_cast<int>((chartH - 2) * ct / axisTopCt);
         const int x = barLeft(i);
         const int w = std::max(1, barRight(i) - x - 1);
         const uint16_t col = ct < a.p25Ct ? GxEPD_GREEN : (ct > a.p75Ct ? GxEPD_RED : GxEPD_YELLOW);
@@ -347,6 +455,14 @@ class DisplayDriver {
       }
 
       // Ticks are derived from the actual local start time of every interval, not from its array index.
+      // Ziel: immer ca. 24 Labels ueber die volle Breite, unabhaengig davon
+      // ob 24h oder 48h sichtbar sind - im 24h-Modus daher stuendlich, im
+      // 48h-Modus alle 2h (gleicher Pixelabstand pro Label in beiden
+      // Faellen). Skaliert automatisch mit, falls Tibber irgendwann
+      // 15-Minuten-Preise liefert (dann waeren es entsprechend mehr Balken
+      // pro Stunde, die Formel haelt den Stunden-Abstand trotzdem bei ~1h/2h).
+      const float hoursSpan = n * s.intervalMinutes / 60.0F;
+      const int hourLabelStep = std::max(1, static_cast<int>(std::round(hoursSpan / 24.0F)));
       display.setFont(&FreeMonoBold9pt7b); display.setTextColor(GxEPD_BLACK);
       for (int i = 0; i < n; ++i) {
         time_t starts = parseIso(points[i].startsAt);
@@ -356,7 +472,7 @@ class DisplayDriver {
         if (local.tm_min != 0 || local.tm_sec != 0) continue;
         const int tickX = barLeft(i) + std::max(1, barRight(i) - barLeft(i)) / 2;
         display.drawLine(tickX, chartY + chartH, tickX, chartY + chartH + 2, GxEPD_BLACK);
-        if ((local.tm_hour % 3) == 0) {
+        if ((local.tm_hour % hourLabelStep) == 0) {
           display.drawLine(tickX, chartY + chartH, tickX, chartY + chartH + 6, GxEPD_BLACK);
           char hour[3]; snprintf(hour, sizeof(hour), "%02d", local.tm_hour);
           centered(String(hour), tickX, 410);
@@ -404,7 +520,9 @@ class DisplayDriver {
       const String updateText = "LETZTES UPDATE: " + localTime(s.fetchedAt) + (s.isStale ? " (OFFLINE)" : "");
       display.setCursor(400, 466); display.print(updateText);
       if (battery.valid) {
-        const int bx = 711, bw = 25, bh = 14, by = 466 - bh;
+        // Rechtsbuendig mit dem Diagrammende (chartX + chartW = 56 + 710 = 766),
+        // Pluspol-Nase (2px) mit eingerechnet.
+        const int bx = 739, bw = 25, bh = 14, by = 466 - bh;
         display.drawRect(bx, by, bw, bh, GxEPD_BLACK);
         display.drawRect(bx + bw, by + 3, 2, bh - 6, GxEPD_BLACK); // Pluspol-Nase
         uint16_t fillColor = battery.percent >= 50 ? GxEPD_GREEN
@@ -420,12 +538,16 @@ class DisplayDriver {
         display.setCursor(bx - tw - 6, by + bh - 3);
         display.print(pctText);
         if (battery.charging) {
-          const int lx = bx - tw - 24; // linker Ankerpunkt, links vom Prozenttext
-          const int ly = by;           // obere Kante auf Hoehe des Batteriegehaeuses
-          // Blitz aus zwei Dreiecken: oberer Teil faellt nach rechts-unten,
-          // unterer Teil schiesst nach links-unten weiter - klassische Zickzackform.
-          display.fillTriangle(lx + 6, ly, lx, ly + 8, lx + 5, ly + 8, GxEPD_BLACK);
-          display.fillTriangle(lx + 5, ly + 8, lx + 9, ly + 6, lx + 3, ly + 14, GxEPD_BLACK);
+          // Blitz sitzt jetzt im Batteriegehaeuse statt links davon, damit
+          // beides als eine Einheit wirkt. Weisse Fuellung mit schwarzer
+          // Kontur, damit er auf jeder Fuellfarbe (gruen/gelb/rot) lesbar
+          // bleibt. Bolt ist 9px breit, 14px hoch - zentriert im 25x14-Gehaeuse.
+          const int lx = bx + 8;
+          const int ly = by;
+          display.fillTriangle(lx + 6, ly, lx, ly + 8, lx + 5, ly + 8, GxEPD_WHITE);
+          display.fillTriangle(lx + 5, ly + 8, lx + 9, ly + 6, lx + 3, ly + 14, GxEPD_WHITE);
+          display.drawTriangle(lx + 6, ly, lx, ly + 8, lx + 5, ly + 8, GxEPD_BLACK);
+          display.drawTriangle(lx + 5, ly + 8, lx + 9, ly + 6, lx + 3, ly + 14, GxEPD_BLACK);
         }
       }
     } while (display.nextPage());
@@ -534,6 +656,21 @@ class PriceProvider {
   }
 };
 
+// Leitet den aktuellen Preis-Index aus der Wanduhrzeit ab, statt ihn aus dem
+// Cache zu uebernehmen. Dadurch stimmt der JETZT-Balken auch auf reinen
+// Redraw-Wakes ohne Tibber-Verbindung, solange die heutigen Preise im Cache
+// stehen.
+int computeCurrentIndex(const PriceSnapshot &s) {
+  if (s.today.empty()) return -1;
+  time_t start = parseIso(s.today[0].startsAt);
+  time_t now = time(nullptr);
+  if (start <= 0 || now <= 0 || s.intervalMinutes == 0) return 0;
+  long idx = static_cast<long>((now - start) / (s.intervalMinutes * 60));
+  if (idx < 0) idx = 0;
+  if (idx >= static_cast<long>(s.today.size())) idx = static_cast<long>(s.today.size()) - 1;
+  return static_cast<int>(idx);
+}
+
 PriceAssessment assess(const PriceSnapshot &s) {
   PriceAssessment a; if (s.currentIndex < 0 || s.today.empty()) return a; std::vector<float> v; for (const auto &p : s.today) v.push_back(p.totalEurPerKwh * 100); std::sort(v.begin(), v.end()); float sum = 0; for (float x : v) sum += x; a.averageCt = sum / v.size(); a.medianCt = v[v.size()/2]; a.p25Ct = a.averageCt * 0.9F; a.p75Ct = a.averageCt * 1.1F; a.currentCt = s.today[s.currentIndex].totalEurPerKwh*100; a.deltaPercent = a.averageCt ? 100*(a.currentCt-a.averageCt)/a.averageCt : 0; a.category = a.currentCt < a.p25Ct ? "NIEDRIG" : (a.currentCt > a.p75Ct ? "HOCH" : "NORMAL");
   std::vector<PricePoint> all; for (size_t i=s.currentIndex;i<s.today.size();++i) all.push_back(s.today[i]); all.insert(all.end(),s.tomorrow.begin(),s.tomorrow.end()); size_t required=std::max<size_t>(1,(AppConfig::NEXT_WINDOW_MINUTES+s.intervalMinutes-1)/s.intervalMinutes);
@@ -548,8 +685,8 @@ uint32_t nextSleepSeconds() {
   const uint32_t period = AppConfig::NETWORK_UPDATE_MINUTES * 60UL;
   time_t nextWake = now + period - (now % period) + AppConfig::UPDATE_OFFSET_SECONDS;
 
-  // The normal next wake after the 00:01 update would be 01:01. Skip all
-  // automatic wakes from 01:00 through 04:59 and resume at 05:01:30 local time.
+  // Letzter regulaerer Wake vor Mitternacht ist 23:01. Skip alle
+  // automatischen Wakes von 00:00 bis 04:59, naechster Wake ist 05:01:30.
   struct tm local;
   localtime_r(&nextWake, &local);
   if (local.tm_hour >= AppConfig::NIGHT_PAUSE_FIRST_HOUR &&
@@ -584,7 +721,7 @@ KeyHoldResult readKeyHold() {
   }
   uint32_t held = millis() - start;
   if (held >= 3000) return KeyHoldResult::MAINTENANCE_TOGGLE;
-  return KeyHoldResult::NONE;
+  return KeyHoldResult::SHORT_PRESS;
 }
 String suffix() { uint64_t mac=ESP.getEfuseMac(); char b[7]; snprintf(b,sizeof(b),"%06llX",mac&0xFFFFFFULL); return b; }
 
@@ -638,6 +775,14 @@ BatteryStatus readBatteryStatus() {
   if (axpReadRegister(0x01, status)) {
     uint8_t direction = (status >> 5) & 0x03; // Bits 6-5
     b.charging = (direction == 0x01);
+    // Diagnose: Lade-Bitinterpretation stammt aus dem urspruenglichen Handoff
+    // und wurde nie auf echter Hardware verifiziert. Rohwert + alle Bits
+    // mitloggen, um die tatsaechliche Bitbelegung beim Laden pruefen zu koennen.
+    Serial.printf("AXP2101 Reg 0x01=0x%02X Bits[7..0]=%d%d%d%d%d%d%d%d direction(Bits6-5)=%u charging=%d\n",
+                  status,
+                  (status >> 7) & 1, (status >> 6) & 1, (status >> 5) & 1, (status >> 4) & 1,
+                  (status >> 3) & 1, (status >> 2) & 1, (status >> 1) & 1, status & 1,
+                  direction, b.charging ? 1 : 0);
   }
   return b;
 }
@@ -648,18 +793,26 @@ Storage storage;
 DisplayDriver display;
 
 void setup() {
+  pinMode(SYS_OUT_LATCH, OUTPUT);
+  digitalWrite(SYS_OUT_LATCH, HIGH);
+
+  // Taster so frueh wie moeglich abfragen, direkt nach der einen GPIO-Aktion,
+  // die zwingend zuerst kommen muss. readKeyHold() wurde bisher erst nach
+  // Serial/Wire/AXP2101-Init (mehrere I2C-Zugriffe + delay(10)) aufgerufen -
+  // bei einem schnellen kurzen Tastendruck war die Taste bis dahin oft schon
+  // wieder losgelassen, das Ergebnis faelschlich NONE statt SHORT_PRESS.
+  pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+  const KeyHoldResult keyHold = readKeyHold();
+
   // Kein delay() nach Serial.begin(): im Batteriebetrieb haengt kein Rechner
   // am USB-Port, jede Wartezeit hier kostet nur unnoetig Strom bei jedem der
   // 24 Wakes/Tag. Native USB-CDC muss nicht "anlaufen" wie klassisches UART.
   Serial.begin(115200);
 
-  pinMode(SYS_OUT_LATCH, OUTPUT);
-  digitalWrite(SYS_OUT_LATCH, HIGH);
-
   const esp_reset_reason_t resetReason = esp_reset_reason();
   const esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
 
-  setenv("TZ", AppConfig::TIMEZONE, 1); tzset(); pinMode(REFRESH_BUTTON, INPUT_PULLUP);
+  setenv("TZ", AppConfig::TIMEZONE, 1); tzset();
   Wire.begin(PMIC_SDA, PMIC_SCL);
   Wire.setTimeOut(50);
 
@@ -669,7 +822,6 @@ void setup() {
   if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) esp_bt_controller_disable();
 
   bool maintenanceMode = storage.loadMaintenanceMode();
-  const KeyHoldResult keyHold = readKeyHold();
 
   // Spontan-Wakeup: das Geraet ist per EXT0 (Taste) aufgewacht, aber es liegt
   // kein echter Tastendruck vor. Deutet auf einen Floating-Pin waehrend des
@@ -688,9 +840,13 @@ void setup() {
       storage.saveMaintenanceMode(maintenanceMode);
       Serial.println(maintenanceMode ? "Wartungsmodus aktiviert." : "Wartungsmodus deaktiviert.");
       break;
+    case KeyHoldResult::SHORT_PRESS:
+      Serial.println("Kurzer Tastendruck: erzwinge Preisabruf unabhaengig vom Zeitfenster.");
+      break;
     case KeyHoldResult::NONE:
       break;
   }
+  const bool manualRefresh = keyHold == KeyHoldResult::SHORT_PRESS;
   RuntimeConfig cfg;
   if (!storage.loadConfig(cfg)) {
     String ap = String(AppConfig::AP_PREFIX) + suffix(), pw = String(AppConfig::AP_PASSWORD_PREFIX) + suffix();
@@ -699,22 +855,82 @@ void setup() {
     if (portal.run(ap, pw)) { display.renderPortalSaved(); delay(2000); ESP.restart(); }
     display.sleep(); sleepFor(AppConfig::FALLBACK_SLEEP_SECONDS, false);
   }
-  PriceSnapshot snapshot; bool cached = storage.loadSnapshot(snapshot); PriceSnapshot previous = snapshot; TibberConnection network(storage); String failure;
-  if (network.connect(cfg)) {
-    time_t last = 0, now = time(nullptr);
-    if (now < 1700000000 || !storage.loadLastTimeSync(last) || now - last >= AppConfig::NTP_SYNC_INTERVAL_SECONDS) {
-      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
-      uint32_t start = millis(); while (time(nullptr) < 1700000000 && millis() - start < 8000) delay(200);
-      if (time(nullptr) >= 1700000000) storage.saveLastTimeSync(time(nullptr));
+  PriceSnapshot snapshot; bool cached = storage.loadSnapshot(snapshot); PriceSnapshot previous = snapshot; String failure;
+
+  // Tagespreise aendern sich nach Veroeffentlichung nicht mehr - Tibber muss
+  // daher nicht bei jedem stuendlichen Wake kontaktiert werden. Entscheidung
+  // rein anhand des Kalendertags: brauchen wir "heute" noch (fehlt oder
+  // veraltet), und/oder ist "morgen" noch nicht da und das Nachmittagsfenster
+  // schon erreicht?
+  const time_t now = time(nullptr);
+  const bool nowValid = now >= 1700000000;
+  const String todayDate = nowValid ? localDateString(now) : "";
+  String todayCachedDate = snapshot.today.empty() ? "" : localDateString(parseIso(snapshot.today[0].startsAt));
+
+  if (nowValid && todayCachedDate != todayDate) {
+    const String tomorrowCachedDate = snapshot.tomorrow.empty() ? "" : localDateString(parseIso(snapshot.tomorrow[0].startsAt));
+    if (tomorrowCachedDate == todayDate) {
+      // Was gestern Nachmittag als "morgen" geholt wurde, ist jetzt "heute" -
+      // Tageswechsel kostet dadurch keine eigene Tibber-Verbindung.
+      snapshot.today = snapshot.tomorrow;
+      snapshot.tomorrow.clear();
+      todayCachedDate = todayDate;
+      Serial.println("Tageswechsel: Cache aus 'morgen' uebernommen, kein Abruf noetig.");
     }
-    PriceSnapshot fresh; PriceProvider provider;
-    if (provider.fetch(cfg, fresh, failure)) {
-      snapshot = fresh;
-      if (!cached || !storage.snapshotHasSamePrices(previous, fresh)) storage.saveSnapshot(snapshot);
-      cached = true;
-    } else if (cached) { snapshot.isStale = true; snapshot.staleReason = failure; }
-    network.off();
-  } else if (cached) { snapshot.isStale = true; snapshot.staleReason = "wifi"; }
+  }
+
+  const bool needToday = !nowValid || todayCachedDate != todayDate;
+  const String tomorrowWantedDate = nowValid ? localDateString(now + 86400) : "";
+  const String tomorrowCachedDateNow = snapshot.tomorrow.empty() ? "" : localDateString(parseIso(snapshot.tomorrow[0].startsAt));
+  const bool needTomorrow = nowValid && tomorrowCachedDateNow != tomorrowWantedDate;
+  struct tm nowLocal = {}; if (nowValid) localtime_r(&now, &nowLocal);
+  const bool tomorrowWindowOpen = nowValid && nowLocal.tm_hour >= AppConfig::TOMORROW_FETCH_HOUR;
+  const bool shouldConnect = needToday || (needTomorrow && tomorrowWindowOpen) || manualRefresh;
+
+  if (shouldConnect) {
+    TibberConnection network(storage);
+    if (network.connect(cfg)) {
+      time_t last = 0, nowAfterConnect = time(nullptr);
+      if (nowAfterConnect < 1700000000 || !storage.loadLastTimeSync(last) || nowAfterConnect - last >= AppConfig::NTP_SYNC_INTERVAL_SECONDS) {
+        configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+        uint32_t start = millis(); while (time(nullptr) < 1700000000 && millis() - start < 8000) delay(200);
+        if (time(nullptr) >= 1700000000) storage.saveLastTimeSync(time(nullptr));
+      }
+      PriceSnapshot fresh; PriceProvider provider;
+      if (provider.fetch(cfg, fresh, failure)) {
+        snapshot = fresh;
+        if (!cached || !storage.snapshotHasSamePrices(previous, fresh)) storage.saveSnapshot(snapshot);
+      } else if (!needToday) {
+        // Nur der Morgen-Abruf ist fehlgeschlagen, "heute" ist weiterhin
+        // gueltig - das ist kein Offline-Zustand, einfach naechste Stunde
+        // erneut versuchen.
+        Serial.println("Morgen-Preise noch nicht verfuegbar oder Abruf fehlgeschlagen, naechster Versuch in einer Stunde.");
+      }
+      network.off();
+    } else if (needToday) {
+      snapshot.isStale = true; snapshot.staleReason = "wifi";
+    } else {
+      // WLAN-Verbindung fuer den Nachmittagsabruf fehlgeschlagen, "heute"
+      // ist aber weiterhin gueltig - bisher lief das komplett unbemerkt durch.
+      Serial.println("WLAN fuer Morgen-Abruf nicht erreichbar, naechster Versuch in einer Stunde.");
+    }
+  }
+
+  cached = !snapshot.today.empty();
+  if (cached) {
+    // Wichtig: Zeit hier NEU auswerten, nicht die "nowValid"/"todayDate" von
+    // oben wiederverwenden - falls die Uhr erst durch den NTP-Sync in diesem
+    // Zyklus gueltig wurde, waere der alte Stand faelschlich noch "ungueltig"
+    // und wuerde trotz frisch geholter Preise OFFLINE anzeigen.
+    const time_t finalNow = time(nullptr);
+    const bool finalNowValid = finalNow >= 1700000000;
+    const String finalTodayDate = finalNowValid ? localDateString(finalNow) : "";
+    const String cachedTodayDate = localDateString(parseIso(snapshot.today[0].startsAt));
+    snapshot.isStale = !finalNowValid || cachedTodayDate != finalTodayDate;
+    if (!snapshot.isStale) snapshot.staleReason = "";
+    else if (snapshot.staleReason.isEmpty()) snapshot.staleReason = failure.isEmpty() ? "wifi" : failure;
+    snapshot.currentIndex = computeCurrentIndex(snapshot);
+  }
 
   // The display and its SPI bus are initialized only for an actual draw, never for a network-only wake.
   display.ensureReady();
