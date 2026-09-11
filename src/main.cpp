@@ -412,22 +412,36 @@ class DisplayDriver {
       for (const auto &p : points) chartMaxSourceCt = std::max(chartMaxSourceCt, p.totalEurPerKwh * 100.0F);
       const float chartMaxCt = std::max(1.0F, chartMaxSourceCt * 1.15F);
 
-      // Nine positions produce eight equal value bands. Every other position is a labelled main mark.
+      // Runde Achsenschritte (5/10/20/25/50 ...) statt gleicher Achtel-Bruchteile
+      // von chartMaxCt - vorher standen dort z.B. 11/23/35/47, kaum ablesbar.
+      // Ziel: ca. 6 Linien, alle beschriftet. Die Balkenskala wird dafuer auf
+      // das naechste Vielfache des Schritts aufgerundet (axisTopCt), damit
+      // Gitterlinien und Balkenhoehen konsistent bleiben.
+      auto niceAxisStep = [](float roughStep) {
+        if (roughStep <= 0) return 1.0F;
+        const float magnitude = powf(10.0F, floorf(log10f(roughStep)));
+        const float residual = roughStep / magnitude;
+        float niceResidual = 1.0F;
+        if (residual > 5.0F) niceResidual = 10.0F;
+        else if (residual > 2.0F) niceResidual = 5.0F;
+        else if (residual > 1.0F) niceResidual = 2.0F;
+        return niceResidual * magnitude;
+      };
+      const float axisStepCt = niceAxisStep(chartMaxCt / 6.0F);
+      const int axisTickCount = static_cast<int>(ceilf(chartMaxCt / axisStepCt));
+      const float axisTopCt = axisTickCount * axisStepCt;
+
       display.setFont(&FreeMonoBold9pt7b);
-      for (int division = 0; division <= 8; ++division) {
-        const int y = chartY + chartH - (division * chartH) / 8;
-        const float value = chartMaxCt * division / 8.0F;
-        if ((division % 2) == 0) {
-          display.drawLine(chartX + 1, y, chartX + chartW - 2, y, GxEPD_BLACK);
-          rightAligned(String(static_cast<int>(roundf(value))), 52, y + 4);
-        } else {
-          display.drawLine(chartX - 4, y, chartX, y, GxEPD_BLACK);
-        }
+      for (int tick = 0; tick <= axisTickCount; ++tick) {
+        const float value = tick * axisStepCt;
+        const int y = chartY + chartH - static_cast<int>((value / axisTopCt) * chartH);
+        display.drawLine(chartX + 1, y, chartX + chartW - 2, y, GxEPD_BLACK);
+        rightAligned(String(static_cast<int>(roundf(value))), 52, y + 4);
       }
 
       for (int i = 0; i < n; ++i) {
         const float ct = points[i].totalEurPerKwh * 100.0F;
-        const int h = static_cast<int>((chartH - 2) * ct / chartMaxCt);
+        const int h = static_cast<int>((chartH - 2) * ct / axisTopCt);
         const int x = barLeft(i);
         const int w = std::max(1, barRight(i) - x - 1);
         const uint16_t col = ct < a.p25Ct ? GxEPD_GREEN : (ct > a.p75Ct ? GxEPD_RED : GxEPD_YELLOW);
@@ -435,6 +449,11 @@ class DisplayDriver {
       }
 
       // Ticks are derived from the actual local start time of every interval, not from its array index.
+      // Label-Dichte an die sichtbare Zeitspanne anpassen: im 24h-Modus (vor
+      // dem Nachmittagsabruf) ist pro Balken doppelt so viel Platz wie im
+      // 48h-Modus - alle 3h beschriften war dort unnoetig sparsam.
+      const float hoursSpan = n * s.intervalMinutes / 60.0F;
+      const int hourLabelStep = hoursSpan <= 24.0F ? 2 : 3;
       display.setFont(&FreeMonoBold9pt7b); display.setTextColor(GxEPD_BLACK);
       for (int i = 0; i < n; ++i) {
         time_t starts = parseIso(points[i].startsAt);
@@ -444,7 +463,7 @@ class DisplayDriver {
         if (local.tm_min != 0 || local.tm_sec != 0) continue;
         const int tickX = barLeft(i) + std::max(1, barRight(i) - barLeft(i)) / 2;
         display.drawLine(tickX, chartY + chartH, tickX, chartY + chartH + 2, GxEPD_BLACK);
-        if ((local.tm_hour % 3) == 0) {
+        if ((local.tm_hour % hourLabelStep) == 0) {
           display.drawLine(tickX, chartY + chartH, tickX, chartY + chartH + 6, GxEPD_BLACK);
           char hour[3]; snprintf(hour, sizeof(hour), "%02d", local.tm_hour);
           centered(String(hour), tickX, 410);
