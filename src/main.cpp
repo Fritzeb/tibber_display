@@ -3,6 +3,16 @@
 // Branch: experimente
 //
 // Aktuelles Experiment, noch nicht auf Hardware verifiziert:
+// - OTA-Update ueber GitHub Releases: bei jedem ohnehin bestehenden
+//   WLAN-Fenster (Tageswechsel/Nachmittag/manueller Refresh) wird zusaetzlich
+//   die GitHub-Releases-API abgefragt (AppConfig::OTA_RELEASES_API_URL). Weicht
+//   der Release-Tag von AppConfig::FIRMWARE_VERSION ab, wird das Release-Asset
+//   "firmware.bin" heruntergeladen und per HTTPUpdate geflasht (Klasse
+//   OtaUpdater), danach Neustart. Voraussetzung: eigene OTA-faehige
+//   Partitionstabelle (partitions.csv, otadata + ota_0/ota_1 statt
+//   default_16MB.csv) - dieser erste Flash mit der neuen Tabelle MUSS per USB
+//   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. Es
+//   gibt (noch) kein automatisches Rollback bei einer defekten neuen Version.
 // - Bug behoben: NTP-Resync war nach dem allerersten Mal wirkungslos, die
 //   Uhr driftete seither unbemerkt (beobachtet: stuendlicher Refresh
 //   wanderte ueber mehrere Tage von "Punkt Uhr" auf "viertel vor"). Fix
@@ -37,6 +47,7 @@
 #include <DNSServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <SPI.h>
@@ -178,6 +189,12 @@ constexpr uint16_t FALLBACK_SLEEP_SECONDS = 900;
 constexpr char TIBBER_URL[] = "https://api.tibber.com/v1-beta/gql";
 constexpr char AP_PREFIX[] = "PhotoPainter-Setup-";
 constexpr char AP_PASSWORD_PREFIX[] = "preis-";
+// Muss bei jedem Release, das ueber GitHub veroeffentlicht wird, auf den
+// neuen Tag-Namen (ohne fuehrendes "v") gesetzt werden - der Vergleich in
+// OtaUpdater ist ein reiner String-Abgleich, keine semantische Versionslogik.
+constexpr char FIRMWARE_VERSION[] = "1.1.0";
+constexpr char OTA_RELEASES_API_URL[] = "https://api.github.com/repos/Fritzeb/tibber_display/releases/latest";
+constexpr char OTA_ASSET_NAME[] = "firmware.bin";
 }
 
 class Storage {
@@ -665,6 +682,59 @@ class PriceProvider {
   }
 };
 
+class OtaUpdater {
+ public:
+  // Prueft die GitHub-Releases-API auf eine neuere Version als
+  // AppConfig::FIRMWARE_VERSION und flasht sie bei Abweichung sofort per
+  // HTTPUpdate. Erwartet ein Release-Asset namens "firmware.bin" (siehe
+  // AppConfig::OTA_ASSET_NAME) - beim Erstellen eines GitHub-Release muss
+  // die kompilierte .bin entsprechend umbenannt und angehaengt werden.
+  // Bei Erfolg startet das Geraet per ESP.restart() neu, die Funktion kehrt
+  // dann nicht zurueck. Nutzt wie PriceProvider eine unverifizierte
+  // TLS-Verbindung (setInsecure) - fuer ein oeffentliches Repo vertretbar,
+  // aber kein Schutz vor TLS-MITM auf dem Weg zu GitHub. Es gibt bewusst
+  // (noch) kein automatisches Rollback: schlaegt die neue Version dauerhaft
+  // fehl, muss per USB neu geflasht werden.
+  static void checkAndApply() {
+    WiFiClientSecure tls; tls.setInsecure(); tls.setTimeout(10000);
+    HTTPClient http; http.setTimeout(10000);
+    if (!http.begin(tls, AppConfig::OTA_RELEASES_API_URL)) { Serial.println("OTA: Verbindung zur Releases-API fehlgeschlagen."); return; }
+    // api.github.com verlangt einen User-Agent-Header, sonst 403.
+    http.addHeader("User-Agent", "tibber-display-ota");
+    http.addHeader("Accept", "application/vnd.github+json");
+    int code = http.GET();
+    if (code != 200) { Serial.printf("OTA: Releases-Abfrage fehlgeschlagen (HTTP %d).\n", code); http.end(); return; }
+    String payload = http.getString();
+    http.end();
+    JsonDocument d;
+    if (deserializeJson(d, payload)) { Serial.println("OTA: Antwort nicht parsbar."); return; }
+    String tag = d["tag_name"] | "";
+    if (tag.isEmpty()) { Serial.println("OTA: kein tag_name in der Antwort gefunden."); return; }
+    if (tag.startsWith("v")) tag.remove(0, 1);
+    if (tag == AppConfig::FIRMWARE_VERSION) { Serial.println("OTA: Firmware bereits aktuell."); return; }
+    String assetUrl;
+    for (JsonObject a : d["assets"].as<JsonArray>()) {
+      if (String(a["name"] | "") == AppConfig::OTA_ASSET_NAME) { assetUrl = a["browser_download_url"] | ""; break; }
+    }
+    if (assetUrl.isEmpty()) { Serial.printf("OTA: neue Version %s gefunden, aber kein %s-Asset im Release.\n", tag.c_str(), AppConfig::OTA_ASSET_NAME); return; }
+    Serial.printf("OTA: neue Version %s gefunden (aktuell %s), lade herunter...\n", tag.c_str(), AppConfig::FIRMWARE_VERSION);
+    WiFiClientSecure otaTls; otaTls.setInsecure(); otaTls.setTimeout(15000);
+    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    switch (httpUpdate.update(otaTls, assetUrl)) {
+      case HTTP_UPDATE_OK:
+        Serial.println("OTA: Update erfolgreich, starte neu.");
+        ESP.restart();
+        break;
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("OTA: Update fehlgeschlagen (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+        break;
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("OTA: keine Aktualisierung durchgefuehrt.");
+        break;
+    }
+  }
+};
+
 // Leitet den aktuellen Preis-Index aus der Wanduhrzeit ab, statt ihn aus dem
 // Cache zu uebernehmen. Dadurch stimmt der JETZT-Balken auch auf reinen
 // Redraw-Wakes ohne Tibber-Verbindung, solange die heutigen Preise im Cache
@@ -922,6 +992,10 @@ void setup() {
         // erneut.
         else settimeofday(&previousTime, nullptr);
       }
+      // Versionscheck in denselben ohnehin bestehenden WLAN-Fenstern wie der
+      // Preisabruf - kein zusaetzliches Aufwachen nur fuer OTA. Bei einem
+      // erfolgreichen Update kehrt checkAndApply() nicht zurueck (Neustart).
+      OtaUpdater::checkAndApply();
       PriceSnapshot fresh; PriceProvider provider;
       if (provider.fetch(cfg, fresh, failure)) {
         snapshot = fresh;
