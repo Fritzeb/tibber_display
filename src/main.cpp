@@ -1,8 +1,16 @@
 // ============================================================================
-// VERSION: v1.1.0 (STABLE) - auf echter Hardware ueber mehrere Tage getestet
-// Branch: main
+// VERSION: BETA - basiert auf v1.1.0 (stable)
+// Branch: experimente
 //
-// Neu seit v1.0.0:
+// Aktuelles Experiment, noch nicht auf Hardware verifiziert:
+// - Bug behoben: NTP-Resync war nach dem allerersten Mal wirkungslos, die
+//   Uhr driftete seither unbemerkt (beobachtet: stuendlicher Refresh
+//   wanderte ueber mehrere Tage von "Punkt Uhr" auf "viertel vor"). Fix
+//   setzt die Uhr vor jedem Resync-Versuch bewusst auf Epoch 0 zurueck,
+//   damit die Wartebedingung wieder korrekt auf die NTP-Antwort wartet
+//   (siehe Kommentar direkt bei configTime() in setup()).
+//
+// Bereits in v1.1.0 (stable) enthalten:
 // - Blitz-Symbol im Batteriegehaeuse (weisse Fuellung, schwarze Kontur)
 //   statt links daneben.
 // - Abruf-Entkopplung: Tibber nur noch 2x/Tag kontaktiert (neuer Tag +
