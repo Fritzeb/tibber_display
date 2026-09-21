@@ -39,6 +39,7 @@
 #include <Fonts/FreeMonoBold24pt7b.h>
 #include <qrcode.h>
 #include <time.h>
+#include <sys/time.h>
 #include <esp_sleep.h>
 #include <esp_bt.h>
 #include <esp_system.h>
@@ -892,9 +893,26 @@ void setup() {
     if (network.connect(cfg)) {
       time_t last = 0, nowAfterConnect = time(nullptr);
       if (nowAfterConnect < 1700000000 || !storage.loadLastTimeSync(last) || nowAfterConnect - last >= AppConfig::NTP_SYNC_INTERVAL_SECONDS) {
+        // Uhr vor jedem Resync-Versuch auf ungueltig zuruecksetzen. Ohne das
+        // ist "time(nullptr) < 1700000000" ab dem zweiten Sync immer schon
+        // falsch (die Uhr laeuft ja schon, nur eventuell mit Drift) - die
+        // Warteschleife unten wuerde sofort durchlaufen, ohne je auf die
+        // tatsaechliche NTP-Antwort zu warten, und saveLastTimeSync() haette
+        // trotzdem "erfolgreich synchronisiert" vermerkt. Ergebnis: die Uhr
+        // driftet nach dem ersten Sync unbemerkt immer weiter (beobachtet:
+        // der stuendliche Refresh wanderte über mehrere Tage von "Punkt Uhr"
+        // auf "viertel vor").
+        struct timeval previousTime; gettimeofday(&previousTime, nullptr);
+        struct timeval invalidate = {0, 0};
+        settimeofday(&invalidate, nullptr);
         configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
         uint32_t start = millis(); while (time(nullptr) < 1700000000 && millis() - start < 8000) delay(200);
         if (time(nullptr) >= 1700000000) storage.saveLastTimeSync(time(nullptr));
+        // Falls die NTP-Antwort nicht rechtzeitig kam: alten (ggf. leicht
+        // gedrifteten) Zeitstand wiederherstellen statt mit zurueckgesetzter
+        // Uhr (Epoch 0) weiterzulaufen - naechstes Zeitfenster versucht es
+        // erneut.
+        else settimeofday(&previousTime, nullptr);
       }
       PriceSnapshot fresh; PriceProvider provider;
       if (provider.fetch(cfg, fresh, failure)) {
