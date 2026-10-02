@@ -31,7 +31,7 @@ jobs:
       - name: Binary-Pfad ermitteln
         id: bin
         run: |
-          path=$(find .pio/build -maxdepth 1 -name firmware.bin | head -1)
+          path=$(find .pio/build -name firmware.bin | head -1)
           if [ -z "$path" ]; then echo "firmware.bin nicht gefunden" >&2; exit 1; fi
           echo "path=$path" >> "$GITHUB_OUTPUT"
 
