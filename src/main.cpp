@@ -1,8 +1,34 @@
 // ============================================================================
-// VERSION: v1.1.0 (STABLE) - auf echter Hardware ueber mehrere Tage getestet
+// VERSION: v1.2.0 (STABLE)
 // Branch: main
 //
-// Neu seit v1.0.0:
+// Neu in v1.2.0 gegenueber v1.1.0:
+// - Diagramm-Bug behoben: ein toter Fallback in PriceProvider::fetch() hing
+//   bei fehlendem Treffer einen Zusatzpunkt an "today" an (ungenutzt, da
+//   setup() currentIndex ohnehin per computeCurrentIndex() ueberschreibt).
+//   Das blies today.size() gelegentlich auf 25 statt 24 Eintraege auf und
+//   verschob dadurch die HEUTE/MORGEN-Trennlinie im 48h-Diagramm um einen
+//   Balken neben die tatsaechliche Mitternachtsgrenze.
+// - OTA-Update ueber GitHub Releases: bei jedem ohnehin bestehenden
+//   WLAN-Fenster (Tageswechsel/Nachmittag/manueller Refresh) wird zusaetzlich
+//   die GitHub-Releases-API abgefragt (AppConfig::OTA_RELEASES_API_URL). Weicht
+//   der Release-Tag von AppConfig::FIRMWARE_VERSION ab, wird das Release-Asset
+//   "firmware.bin" heruntergeladen und per HTTPUpdate geflasht (Klasse
+//   OtaUpdater), danach Neustart. Voraussetzung: eigene OTA-faehige
+//   Partitionstabelle (partitions.csv, otadata + ota_0/ota_1 statt
+//   default_16MB.csv) - der erste Flash mit dieser Tabelle MUSS per USB
+//   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. Es
+//   gibt (noch) kein automatisches Rollback bei einer defekten neuen Version.
+//   Auf Hardware verifiziert (ein Geraet, USB-geflasht).
+// - Bug behoben: NTP-Resync war nach dem allerersten Mal wirkungslos, die
+//   Uhr driftete seither unbemerkt (beobachtet: stuendlicher Refresh
+//   wanderte ueber mehrere Tage von "Punkt Uhr" auf "viertel vor"). Fix
+//   setzt die Uhr vor jedem Resync-Versuch bewusst auf Epoch 0 zurueck,
+//   damit die Wartebedingung wieder korrekt auf die NTP-Antwort wartet
+//   (siehe Kommentar direkt bei configTime() in setup()). Auf Hardware
+//   ueber mehrere Tage verifiziert.
+//
+// Bereits in v1.1.0 enthalten:
 // - Blitz-Symbol im Batteriegehaeuse (weisse Fuellung, schwarze Kontur)
 //   statt links daneben.
 // - Abruf-Entkopplung: Tibber nur noch 2x/Tag kontaktiert (neuer Tag +
@@ -29,6 +55,7 @@
 #include <DNSServer.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <SPI.h>
@@ -39,6 +66,7 @@
 #include <Fonts/FreeMonoBold24pt7b.h>
 #include <qrcode.h>
 #include <time.h>
+#include <sys/time.h>
 #include <esp_sleep.h>
 #include <esp_bt.h>
 #include <esp_system.h>
@@ -169,6 +197,12 @@ constexpr uint16_t FALLBACK_SLEEP_SECONDS = 900;
 constexpr char TIBBER_URL[] = "https://api.tibber.com/v1-beta/gql";
 constexpr char AP_PREFIX[] = "PhotoPainter-Setup-";
 constexpr char AP_PASSWORD_PREFIX[] = "preis-";
+// Muss bei jedem Release, das ueber GitHub veroeffentlicht wird, auf den
+// neuen Tag-Namen (ohne fuehrendes "v") gesetzt werden - der Vergleich in
+// OtaUpdater ist ein reiner String-Abgleich, keine semantische Versionslogik.
+constexpr char FIRMWARE_VERSION[] = "1.2.0";
+constexpr char OTA_RELEASES_API_URL[] = "https://api.github.com/repos/Fritzeb/tibber_display/releases/latest";
+constexpr char OTA_ASSET_NAME[] = "firmware.bin";
 }
 
 class Storage {
@@ -650,9 +684,67 @@ class PriceProvider {
     // first returned Home. No Home ID is requested or stored in this project.
     JsonObject home = homes[0];
     JsonObject info = home["currentSubscription"]["priceInfo"]; if (info.isNull()) { reason = "keine-preise"; return false; } out = PriceSnapshot(); out.homeId = home["id"].as<String>(); points(info["today"].as<JsonArray>(), out.today); points(info["tomorrow"].as<JsonArray>(), out.tomorrow); if (out.today.empty()) { reason = "keine-preise"; return false; }
-    String cur = info["current"]["startsAt"] | ""; for (size_t i = 0; i < out.today.size(); ++i) if (out.today[i].startsAt == cur) out.currentIndex = i; if (out.currentIndex < 0 && !cur.isEmpty()) { out.today.push_back({cur, info["current"]["total"] | 0.0F, info["current"]["currency"] | "EUR"}); out.currentIndex = out.today.size() - 1; }
+    // currentIndex wird nicht hier gesetzt: setup() ueberschreibt ihn nach
+    // jedem Abruf ohnehin mit computeCurrentIndex() (anhand der Uhrzeit, nicht
+    // des API-Felds "current"). Ein frueherer Fallback haengte bei fehlendem
+    // Treffer einen Zusatzpunkt an "today" an, um trotzdem einen Index zu
+    // haben - der wurde nie gelesen, blies aber today.size() auf 25 auf und
+    // verschob dadurch die HEUTE/MORGEN-Trennlinie im Diagramm um einen Balken.
     if (out.today.size() > 1) { time_t a = parseIso(out.today[0].startsAt), b = parseIso(out.today[1].startsAt); if (a && b > a) out.intervalMinutes = (b - a) / 60; }
     out.fetchedAt = isoNow(); out.isStale = false; return true;
+  }
+};
+
+class OtaUpdater {
+ public:
+  // Prueft die GitHub-Releases-API auf eine neuere Version als
+  // AppConfig::FIRMWARE_VERSION und flasht sie bei Abweichung sofort per
+  // HTTPUpdate. Erwartet ein Release-Asset namens "firmware.bin" (siehe
+  // AppConfig::OTA_ASSET_NAME) - beim Erstellen eines GitHub-Release muss
+  // die kompilierte .bin entsprechend umbenannt und angehaengt werden.
+  // Bei Erfolg startet das Geraet per ESP.restart() neu, die Funktion kehrt
+  // dann nicht zurueck. Nutzt wie PriceProvider eine unverifizierte
+  // TLS-Verbindung (setInsecure) - fuer ein oeffentliches Repo vertretbar,
+  // aber kein Schutz vor TLS-MITM auf dem Weg zu GitHub. Es gibt bewusst
+  // (noch) kein automatisches Rollback: schlaegt die neue Version dauerhaft
+  // fehl, muss per USB neu geflasht werden.
+  static void checkAndApply() {
+    WiFiClientSecure tls; tls.setInsecure(); tls.setTimeout(10000);
+    HTTPClient http; http.setTimeout(10000);
+    if (!http.begin(tls, AppConfig::OTA_RELEASES_API_URL)) { Serial.println("OTA: Verbindung zur Releases-API fehlgeschlagen."); return; }
+    // api.github.com verlangt einen User-Agent-Header, sonst 403.
+    http.addHeader("User-Agent", "tibber-display-ota");
+    http.addHeader("Accept", "application/vnd.github+json");
+    int code = http.GET();
+    if (code != 200) { Serial.printf("OTA: Releases-Abfrage fehlgeschlagen (HTTP %d).\n", code); http.end(); return; }
+    String payload = http.getString();
+    http.end();
+    JsonDocument d;
+    if (deserializeJson(d, payload)) { Serial.println("OTA: Antwort nicht parsbar."); return; }
+    String tag = d["tag_name"] | "";
+    if (tag.isEmpty()) { Serial.println("OTA: kein tag_name in der Antwort gefunden."); return; }
+    if (tag.startsWith("v")) tag.remove(0, 1);
+    if (tag == AppConfig::FIRMWARE_VERSION) { Serial.println("OTA: Firmware bereits aktuell."); return; }
+    String assetUrl;
+    for (JsonObject a : d["assets"].as<JsonArray>()) {
+      if (String(a["name"] | "") == AppConfig::OTA_ASSET_NAME) { assetUrl = a["browser_download_url"] | ""; break; }
+    }
+    if (assetUrl.isEmpty()) { Serial.printf("OTA: neue Version %s gefunden, aber kein %s-Asset im Release.\n", tag.c_str(), AppConfig::OTA_ASSET_NAME); return; }
+    Serial.printf("OTA: neue Version %s gefunden (aktuell %s), lade herunter...\n", tag.c_str(), AppConfig::FIRMWARE_VERSION);
+    WiFiClientSecure otaTls; otaTls.setInsecure(); otaTls.setTimeout(15000);
+    httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    switch (httpUpdate.update(otaTls, assetUrl)) {
+      case HTTP_UPDATE_OK:
+        Serial.println("OTA: Update erfolgreich, starte neu.");
+        ESP.restart();
+        break;
+      case HTTP_UPDATE_FAILED:
+        Serial.printf("OTA: Update fehlgeschlagen (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+        break;
+      case HTTP_UPDATE_NO_UPDATES:
+        Serial.println("OTA: keine Aktualisierung durchgefuehrt.");
+        break;
+    }
   }
 };
 
@@ -892,10 +984,31 @@ void setup() {
     if (network.connect(cfg)) {
       time_t last = 0, nowAfterConnect = time(nullptr);
       if (nowAfterConnect < 1700000000 || !storage.loadLastTimeSync(last) || nowAfterConnect - last >= AppConfig::NTP_SYNC_INTERVAL_SECONDS) {
+        // Uhr vor jedem Resync-Versuch auf ungueltig zuruecksetzen. Ohne das
+        // ist "time(nullptr) < 1700000000" ab dem zweiten Sync immer schon
+        // falsch (die Uhr laeuft ja schon, nur eventuell mit Drift) - die
+        // Warteschleife unten wuerde sofort durchlaufen, ohne je auf die
+        // tatsaechliche NTP-Antwort zu warten, und saveLastTimeSync() haette
+        // trotzdem "erfolgreich synchronisiert" vermerkt. Ergebnis: die Uhr
+        // driftet nach dem ersten Sync unbemerkt immer weiter (beobachtet:
+        // der stuendliche Refresh wanderte über mehrere Tage von "Punkt Uhr"
+        // auf "viertel vor").
+        struct timeval previousTime; gettimeofday(&previousTime, nullptr);
+        struct timeval invalidate = {0, 0};
+        settimeofday(&invalidate, nullptr);
         configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
         uint32_t start = millis(); while (time(nullptr) < 1700000000 && millis() - start < 8000) delay(200);
         if (time(nullptr) >= 1700000000) storage.saveLastTimeSync(time(nullptr));
+        // Falls die NTP-Antwort nicht rechtzeitig kam: alten (ggf. leicht
+        // gedrifteten) Zeitstand wiederherstellen statt mit zurueckgesetzter
+        // Uhr (Epoch 0) weiterzulaufen - naechstes Zeitfenster versucht es
+        // erneut.
+        else settimeofday(&previousTime, nullptr);
       }
+      // Versionscheck in denselben ohnehin bestehenden WLAN-Fenstern wie der
+      // Preisabruf - kein zusaetzliches Aufwachen nur fuer OTA. Bei einem
+      // erfolgreichen Update kehrt checkAndApply() nicht zurueck (Neustart).
+      OtaUpdater::checkAndApply();
       PriceSnapshot fresh; PriceProvider provider;
       if (provider.fetch(cfg, fresh, failure)) {
         snapshot = fresh;
