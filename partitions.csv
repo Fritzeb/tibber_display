@@ -1,0 +1,16 @@
+# Custom OTA-faehige Partitionstabelle fuer den Waveshare ESP32-S3
+# PhotoPainter (16 MB Flash). Ersetzt die Standard-default_16MB.csv, die
+# keine otadata-Partition und nur einen einzelnen App-Slot hat.
+#
+# Zwei App-Slots (ota_0/ota_1) je 6,25 MB erlauben HTTPUpdate, waehrend die
+# aktuell laufende Firmware weiterlaeuft: neue Version wird in den jeweils
+# anderen Slot geschrieben, otadata verweist danach per Boot-Flag auf ihn.
+# Aktuelle Firmware ist ca. 1 MB, 6,25 MB pro Slot lassen reichlich Puffer
+# fuer Wachstum. Kein separates Dateisystem (SPIFFS/LittleFS) noetig, die
+# Konfiguration liegt komplett in NVS.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+app0,       app,  ota_0,    0x10000,  0x640000,
+app1,       app,  ota_1,    0x650000, 0x640000,
