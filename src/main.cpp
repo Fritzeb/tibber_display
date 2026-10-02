@@ -1,8 +1,14 @@
 // ============================================================================
-// VERSION: BETA - basiert auf v1.1.0 (stable)
-// Branch: experimente
+// VERSION: v1.2.0 (STABLE)
+// Branch: main
 //
-// Aktuelles Experiment, noch nicht auf Hardware verifiziert:
+// Neu in v1.2.0 gegenueber v1.1.0:
+// - Diagramm-Bug behoben: ein toter Fallback in PriceProvider::fetch() hing
+//   bei fehlendem Treffer einen Zusatzpunkt an "today" an (ungenutzt, da
+//   setup() currentIndex ohnehin per computeCurrentIndex() ueberschreibt).
+//   Das blies today.size() gelegentlich auf 25 statt 24 Eintraege auf und
+//   verschob dadurch die HEUTE/MORGEN-Trennlinie im 48h-Diagramm um einen
+//   Balken neben die tatsaechliche Mitternachtsgrenze.
 // - OTA-Update ueber GitHub Releases: bei jedem ohnehin bestehenden
 //   WLAN-Fenster (Tageswechsel/Nachmittag/manueller Refresh) wird zusaetzlich
 //   die GitHub-Releases-API abgefragt (AppConfig::OTA_RELEASES_API_URL). Weicht
@@ -10,17 +16,19 @@
 //   "firmware.bin" heruntergeladen und per HTTPUpdate geflasht (Klasse
 //   OtaUpdater), danach Neustart. Voraussetzung: eigene OTA-faehige
 //   Partitionstabelle (partitions.csv, otadata + ota_0/ota_1 statt
-//   default_16MB.csv) - dieser erste Flash mit der neuen Tabelle MUSS per USB
+//   default_16MB.csv) - der erste Flash mit dieser Tabelle MUSS per USB
 //   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. Es
 //   gibt (noch) kein automatisches Rollback bei einer defekten neuen Version.
+//   Auf Hardware verifiziert (ein Geraet, USB-geflasht).
 // - Bug behoben: NTP-Resync war nach dem allerersten Mal wirkungslos, die
 //   Uhr driftete seither unbemerkt (beobachtet: stuendlicher Refresh
 //   wanderte ueber mehrere Tage von "Punkt Uhr" auf "viertel vor"). Fix
 //   setzt die Uhr vor jedem Resync-Versuch bewusst auf Epoch 0 zurueck,
 //   damit die Wartebedingung wieder korrekt auf die NTP-Antwort wartet
-//   (siehe Kommentar direkt bei configTime() in setup()).
+//   (siehe Kommentar direkt bei configTime() in setup()). Auf Hardware
+//   ueber mehrere Tage verifiziert.
 //
-// Bereits in v1.1.0 (stable) enthalten:
+// Bereits in v1.1.0 enthalten:
 // - Blitz-Symbol im Batteriegehaeuse (weisse Fuellung, schwarze Kontur)
 //   statt links daneben.
 // - Abruf-Entkopplung: Tibber nur noch 2x/Tag kontaktiert (neuer Tag +
@@ -192,7 +200,7 @@ constexpr char AP_PASSWORD_PREFIX[] = "preis-";
 // Muss bei jedem Release, das ueber GitHub veroeffentlicht wird, auf den
 // neuen Tag-Namen (ohne fuehrendes "v") gesetzt werden - der Vergleich in
 // OtaUpdater ist ein reiner String-Abgleich, keine semantische Versionslogik.
-constexpr char FIRMWARE_VERSION[] = "1.1.0";
+constexpr char FIRMWARE_VERSION[] = "1.2.0";
 constexpr char OTA_RELEASES_API_URL[] = "https://api.github.com/repos/Fritzeb/tibber_display/releases/latest";
 constexpr char OTA_ASSET_NAME[] = "firmware.bin";
 }
@@ -676,7 +684,12 @@ class PriceProvider {
     // first returned Home. No Home ID is requested or stored in this project.
     JsonObject home = homes[0];
     JsonObject info = home["currentSubscription"]["priceInfo"]; if (info.isNull()) { reason = "keine-preise"; return false; } out = PriceSnapshot(); out.homeId = home["id"].as<String>(); points(info["today"].as<JsonArray>(), out.today); points(info["tomorrow"].as<JsonArray>(), out.tomorrow); if (out.today.empty()) { reason = "keine-preise"; return false; }
-    String cur = info["current"]["startsAt"] | ""; for (size_t i = 0; i < out.today.size(); ++i) if (out.today[i].startsAt == cur) out.currentIndex = i; if (out.currentIndex < 0 && !cur.isEmpty()) { out.today.push_back({cur, info["current"]["total"] | 0.0F, info["current"]["currency"] | "EUR"}); out.currentIndex = out.today.size() - 1; }
+    // currentIndex wird nicht hier gesetzt: setup() ueberschreibt ihn nach
+    // jedem Abruf ohnehin mit computeCurrentIndex() (anhand der Uhrzeit, nicht
+    // des API-Felds "current"). Ein frueherer Fallback haengte bei fehlendem
+    // Treffer einen Zusatzpunkt an "today" an, um trotzdem einen Index zu
+    // haben - der wurde nie gelesen, blies aber today.size() auf 25 auf und
+    // verschob dadurch die HEUTE/MORGEN-Trennlinie im Diagramm um einen Balken.
     if (out.today.size() > 1) { time_t a = parseIso(out.today[0].startsAt), b = parseIso(out.today[1].startsAt); if (a && b > a) out.intervalMinutes = (b - a) / 60; }
     out.fetchedAt = isoNow(); out.isStale = false; return true;
   }
