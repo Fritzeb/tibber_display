@@ -1,0 +1,49 @@
+name: Firmware bauen und ans Release anhaengen
+
+# Laeuft auf GitHub-Servern, nicht lokal - damit fuer ein neues Release kein
+# PlatformIO-Setup auf dem eigenen Rechner noetig ist. Ausloeser: ein auf
+# GitHub veroeffentlichtes Release (Tag + Titel reichen, keine Datei-Upload
+# noetig). OtaUpdater (main.cpp) erwartet das Asset exakt als "firmware.bin".
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: PlatformIO installieren
+        run: pip install --upgrade platformio
+
+      - name: Firmware bauen
+        run: pio run
+
+      - name: Binary-Pfad ermitteln
+        id: bin
+        run: |
+          path=$(find .pio/build -maxdepth 1 -name firmware.bin | head -1)
+          if [ -z "$path" ]; then echo "firmware.bin nicht gefunden" >&2; exit 1; fi
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+
+      - name: An Release anhaengen
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.bin.outputs.path }}
+
+      - name: Als Workflow-Artefakt bereitstellen (manueller Lauf)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: ${{ steps.bin.outputs.path }}
