@@ -1,8 +1,24 @@
 // ============================================================================
-// VERSION: v1.2.0 (STABLE)
-// Branch: main
+// VERSION: BETA - basiert auf v1.2.0 (stable)
+// Branch: experimente
 //
-// Neu in v1.2.0 gegenueber v1.1.0:
+// Aktuelles Experiment, noch nicht auf Hardware verifiziert:
+// - Automatisches OTA-Rollback: OtaUpdater::checkAndApply() setzt vor dem
+//   Neustart nach einem Update ein "otaPending"-Flag (Storage). Der
+//   Rollback-Check am Anfang von setup() (vor Wire/AXP2101/WLAN-Init, damit
+//   ein haengender I2C-Bus o.ae. in der kaputten Version nicht den Zaehler
+//   verhindert) zaehlt bei jedem Boot mit, solange das Flag steht - also bei
+//   jedem Absturz/Watchdog-Reset der neuen Version vor einem vollstaendigen
+//   Zyklus. Nach AppConfig::OTA_MAX_BOOT_ATTEMPTS (3) Fehlversuchen schaltet
+//   esp_ota_set_boot_partition() zurueck auf die vorherige Partition. Ein
+//   vollstaendiger, bis zum Deep Sleep durchlaufener Zyklus loescht das Flag
+//   stattdessen (Bestaetigung, kurz vor dem Wartungsmodus-/Sleep-Zweig in
+//   setup()). Deckt Abstuerze/Haenger ab, die ueber Watchdog-Reset oder
+//   manuellen Reset enden - keine Erkennung fuer ein Firmware, das zwar
+//   lauffaehig bleibt, aber falsch funktioniert (z.B. falsche Preise
+//   anzeigt), da dafuer kein automatisches Kriterium existiert.
+//
+// Bereits in v1.2.0 (stable) enthalten:
 // - Diagramm-Bug behoben: ein toter Fallback in PriceProvider::fetch() hing
 //   bei fehlendem Treffer einen Zusatzpunkt an "today" an (ungenutzt, da
 //   setup() currentIndex ohnehin per computeCurrentIndex() ueberschreibt).
@@ -17,9 +33,10 @@
 //   OtaUpdater), danach Neustart. Voraussetzung: eigene OTA-faehige
 //   Partitionstabelle (partitions.csv, otadata + ota_0/ota_1 statt
 //   default_16MB.csv) - der erste Flash mit dieser Tabelle MUSS per USB
-//   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. Es
-//   gibt (noch) kein automatisches Rollback bei einer defekten neuen Version.
-//   Auf Hardware verifiziert (ein Geraet, USB-geflasht).
+//   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. In
+//   v1.2.0 noch kein automatisches Rollback bei einer defekten neuen Version
+//   (siehe aktuelles Experiment oben). Auf Hardware verifiziert (ein Geraet,
+//   USB-geflasht).
 // - Bug behoben: NTP-Resync war nach dem allerersten Mal wirkungslos, die
 //   Uhr driftete seither unbemerkt (beobachtet: stuendlicher Refresh
 //   wanderte ueber mehrere Tage von "Punkt Uhr" auf "viertel vor"). Fix
@@ -70,6 +87,7 @@
 #include <esp_sleep.h>
 #include <esp_bt.h>
 #include <esp_system.h>
+#include <esp_ota_ops.h>
 #include <driver/rtc_io.h>
 #include <algorithm>
 #include <vector>
@@ -203,6 +221,10 @@ constexpr char AP_PASSWORD_PREFIX[] = "preis-";
 constexpr char FIRMWARE_VERSION[] = "1.2.0";
 constexpr char OTA_RELEASES_API_URL[] = "https://api.github.com/repos/Fritzeb/tibber_display/releases/latest";
 constexpr char OTA_ASSET_NAME[] = "firmware.bin";
+// Wie viele Boot-Versuche eine frische OTA-Version hat, um einen
+// vollstaendigen Zyklus bis zum Deep Sleep zu schaffen, bevor automatisch
+// auf die vorherige Version zurueckgeschaltet wird.
+constexpr uint8_t OTA_MAX_BOOT_ATTEMPTS = 3;
 }
 
 class Storage {
@@ -273,6 +295,24 @@ class Storage {
   }
   void saveMaintenanceMode(bool enabled) {
     Preferences p; if (p.begin("settings", false)) { p.putBool("maint", enabled); p.end(); }
+  }
+  // Rollback-Zustand fuer frisch per OTA geflashte Firmware: "pending" heisst
+  // "noch nicht bestaetigt", "attempts" zaehlt Boot-Versuche seit dem Update.
+  // Siehe OtaUpdater::checkAndApply() und der Rollback-Check am Anfang von
+  // setup().
+  bool loadOtaBootPending(uint8_t &attempts) {
+    Preferences p; if (!p.begin("settings", true)) { attempts = 0; return false; }
+    bool pending = p.getBool("otaPending", false);
+    attempts = p.getUChar("otaAttempts", 0);
+    p.end();
+    return pending;
+  }
+  void saveOtaBootPending(bool pending, uint8_t attempts) {
+    Preferences p; if (p.begin("settings", false)) {
+      p.putBool("otaPending", pending);
+      p.putUChar("otaAttempts", attempts);
+      p.end();
+    }
   }
   // Persistiert Reset-/Wakeup-Ursache und einen Zaehler fuer Spontan-Wakeups
   // (EXT0 ohne tatsaechlichen Tastendruck). Ohne angeschlossenen Rechner sieht
@@ -705,10 +745,19 @@ class OtaUpdater {
   // Bei Erfolg startet das Geraet per ESP.restart() neu, die Funktion kehrt
   // dann nicht zurueck. Nutzt wie PriceProvider eine unverifizierte
   // TLS-Verbindung (setInsecure) - fuer ein oeffentliches Repo vertretbar,
-  // aber kein Schutz vor TLS-MITM auf dem Weg zu GitHub. Es gibt bewusst
-  // (noch) kein automatisches Rollback: schlaegt die neue Version dauerhaft
-  // fehl, muss per USB neu geflasht werden.
-  static void checkAndApply() {
+  // aber kein Schutz vor TLS-MITM auf dem Weg zu GitHub.
+  //
+  // Rollback bei defekter Version: unmittelbar vor dem Neustart wird in
+  // Storage "otaPending" gesetzt. Der Rollback-Check am Anfang von setup()
+  // zaehlt bei jedem Boot mit, solange dieses Flag steht; erst ein
+  // vollstaendiger, erfolgreich bis zum Deep Sleep durchlaufener Zyklus
+  // loescht es wieder (siehe dort). Haengt sich die neue Version vorher auf
+  // oder stuerzt ab (Reset/Watchdog), zaehlt der naechste Boot einen
+  // weiteren Versuch; nach AppConfig::OTA_MAX_BOOT_ATTEMPTS Fehlversuchen
+  // schaltet der Bootloader per esp_ota_set_boot_partition() zurueck auf die
+  // vorherige Partition - die davor laufende, nachweislich funktionierende
+  // Version.
+  static void checkAndApply(Storage &storage) {
     WiFiClientSecure tls; tls.setInsecure(); tls.setTimeout(10000);
     HTTPClient http; http.setTimeout(10000);
     if (!http.begin(tls, AppConfig::OTA_RELEASES_API_URL)) { Serial.println("OTA: Verbindung zur Releases-API fehlgeschlagen."); return; }
@@ -736,6 +785,10 @@ class OtaUpdater {
     switch (httpUpdate.update(otaTls, assetUrl)) {
       case HTTP_UPDATE_OK:
         Serial.println("OTA: Update erfolgreich, starte neu.");
+        // Erst HIER setzen, nicht schon vor dem Download: ein fehlgeschlagener
+        // Download/Flash-Vorgang soll nicht die alte, weiterhin laufende
+        // Version in einen Pending-Zustand versetzen.
+        storage.saveOtaBootPending(true, 0);
         ESP.restart();
         break;
       case HTTP_UPDATE_FAILED:
@@ -904,6 +957,37 @@ void setup() {
   const esp_reset_reason_t resetReason = esp_reset_reason();
   const esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
 
+  // OTA-Rollback-Check: so frueh wie moeglich, vor Wire/AXP2101/WLAN-Init,
+  // die in einer kaputten neuen Version haengen oder abstuerzen koennten.
+  // "otaPending" steht nur direkt nach einem OTA-Update (siehe
+  // OtaUpdater::checkAndApply()), bis ein vollstaendiger Zyklus es am Ende
+  // von setup() wieder loescht. Jeder Boot, der das Flag noch gesetzt
+  // vorfindet, zaehlt also einen fehlgeschlagenen Versuch der neuen Version
+  // (Absturz/Watchdog-Reset vor Abschluss des letzten Zyklus). Nach
+  // AppConfig::OTA_MAX_BOOT_ATTEMPTS solchen Versuchen schaltet der
+  // Bootloader zurueck auf die vorherige, nachweislich funktionierende
+  // Partition.
+  {
+    uint8_t otaAttempts = 0;
+    if (storage.loadOtaBootPending(otaAttempts)) {
+      ++otaAttempts;
+      Serial.printf("OTA-Rollback-Check: Versuch %u/%u seit letztem Update.\n", otaAttempts, AppConfig::OTA_MAX_BOOT_ATTEMPTS);
+      if (otaAttempts >= AppConfig::OTA_MAX_BOOT_ATTEMPTS) {
+        const esp_partition_t *rollbackTarget = esp_ota_get_next_update_partition(nullptr);
+        if (rollbackTarget && esp_ota_set_boot_partition(rollbackTarget) == ESP_OK) {
+          Serial.println("OTA-Rollback: zu oft fehlgeschlagen, schalte auf vorherige Partition zurueck.");
+          storage.saveOtaBootPending(false, 0);
+          ESP.restart();
+        } else {
+          Serial.println("OTA-Rollback: Zielpartition nicht ermittelbar, versuche weiter.");
+          storage.saveOtaBootPending(true, otaAttempts);
+        }
+      } else {
+        storage.saveOtaBootPending(true, otaAttempts);
+      }
+    }
+  }
+
   setenv("TZ", AppConfig::TIMEZONE, 1); tzset();
   Wire.begin(PMIC_SDA, PMIC_SCL);
   Wire.setTimeOut(50);
@@ -1008,7 +1092,7 @@ void setup() {
       // Versionscheck in denselben ohnehin bestehenden WLAN-Fenstern wie der
       // Preisabruf - kein zusaetzliches Aufwachen nur fuer OTA. Bei einem
       // erfolgreichen Update kehrt checkAndApply() nicht zurueck (Neustart).
-      OtaUpdater::checkAndApply();
+      OtaUpdater::checkAndApply(storage);
       PriceSnapshot fresh; PriceProvider provider;
       if (provider.fetch(cfg, fresh, failure)) {
         snapshot = fresh;
@@ -1050,6 +1134,19 @@ void setup() {
   if (!cached) display.renderNoData(failure.isEmpty() ? "WLAN nicht erreichbar" : failure, maintenanceMode);
   else display.render(snapshot, assess(snapshot), maintenanceMode, readBatteryStatus());
   display.sleep();
+
+  // OTA-Rollback-Bestaetigung: ein vollstaendiger Zyklus bis hierher (Preise
+  // verarbeitet, Display gezeichnet) beweist, dass die aktuelle Version
+  // funktioniert. Pending-Flag loeschen, falls gesetzt - siehe
+  // OtaUpdater::checkAndApply() und der Rollback-Check am Anfang von setup().
+  {
+    uint8_t otaAttempts = 0;
+    if (storage.loadOtaBootPending(otaAttempts)) {
+      Serial.println("OTA: Zyklus erfolgreich durchlaufen, Version bestaetigt.");
+      storage.saveOtaBootPending(false, 0);
+    }
+  }
+
   if (maintenanceMode) {
     Serial.println("Wartungsmodus aktiv - kein Deep Sleep. KEY 3 Sek. halten zum Beenden.");
     while (true) {
