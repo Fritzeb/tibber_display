@@ -17,6 +17,13 @@
 //   manuellen Reset enden - keine Erkennung fuer ein Firmware, das zwar
 //   lauffaehig bleibt, aber falsch funktioniert (z.B. falsche Preise
 //   anzeigt), da dafuer kein automatisches Kriterium existiert.
+// - Wartungsmodus zeigt jetzt Firmware-Version und Installationsdatum in der
+//   schwarzen Banner-Zeile (DisplayDriver::maintenanceBanner). Das Datum wird
+//   in Storage::fwVersion/fwInstalledAt vermerkt, sobald eine Version zum
+//   ersten Mal eine gueltige Uhrzeit sieht, die vom zuletzt vermerkten Stand
+//   abweicht (neue Version oder allererster Boot) - unabhaengig vom
+//   OTA-Rollback-Mechanismus, da das Datum auch beim allerersten USB-Flash
+//   stimmen soll, nicht nur nach einem OTA-Update.
 //
 // Bereits in v1.2.0 (stable) enthalten:
 // - Diagramm-Bug behoben: ein toter Fallback in PriceProvider::fetch() hing
@@ -314,6 +321,23 @@ class Storage {
       p.end();
     }
   }
+  // Welche Firmware-Version zuletzt lief und seit wann (lokales Datum,
+  // "YYYY-MM-DD") - fuer die Anzeige im Wartungsmodus. Wird in setup() bei
+  // jedem Boot mit AppConfig::FIRMWARE_VERSION abgeglichen und nur bei einer
+  // Abweichung neu geschrieben (neue Version erstmals gesehen).
+  void loadFirmwareInstallInfo(String &version, String &installedAt) {
+    Preferences p; if (!p.begin("settings", true)) { version = ""; installedAt = ""; return; }
+    version = p.getString("fwVersion", "");
+    installedAt = p.getString("fwInstalledAt", "");
+    p.end();
+  }
+  void saveFirmwareInstallInfo(const String &version, const String &installedAt) {
+    Preferences p; if (p.begin("settings", false)) {
+      p.putString("fwVersion", version);
+      p.putString("fwInstalledAt", installedAt);
+      p.end();
+    }
+  }
   // Persistiert Reset-/Wakeup-Ursache und einen Zaehler fuer Spontan-Wakeups
   // (EXT0 ohne tatsaechlichen Tastendruck). Ohne angeschlossenen Rechner sieht
   // niemand eine reine Serial-Logzeile live - dieser Zaehler bleibt dagegen bis
@@ -385,6 +409,17 @@ class DisplayDriver {
   bool ready = false;
   void header(const char *title) { display.setTextColor(GxEPD_BLACK); display.setFont(&FreeMonoBold18pt7b); display.setCursor(24, 38); display.print(title); display.drawLine(20, 49, 780, 49, GxEPD_BLACK); }
   void line(int y, const String &text, uint16_t color = GxEPD_BLACK) { display.setTextColor(color); display.setFont(&FreeMonoBold12pt7b); display.setCursor(26, y); display.print(text); }
+  void maintenanceBanner(const String &installedAt) {
+    const int barY = 66, barH = 20;
+    display.fillRect(20, barY, 760, barH, GxEPD_BLACK);
+    display.setTextColor(GxEPD_WHITE);
+    display.setFont(&FreeMonoBold9pt7b);
+    display.setCursor(28, barY + 15);
+    String text = "WARTUNGSMODUS - v" + String(AppConfig::FIRMWARE_VERSION);
+    if (!installedAt.isEmpty()) text += " (" + installedAt + ")";
+    text += " - KEY 5s HALTEN";
+    display.print(text);
+  }
  public:
   DisplayDriver() : display(GxEPD2_730c_GDEP073E01(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY)) {}
   bool begin() { if (ready) return true; SPI.begin(EPD_SCK, -1, EPD_MOSI, EPD_CS); display.init(115200, true, 2, false); display.setRotation(2); ready = true; return true; }
@@ -405,15 +440,10 @@ class DisplayDriver {
     } while (display.nextPage());
   }
   void renderPortalSaved() { display.firstPage(); do { display.fillScreen(GxEPD_WHITE); header("EINRICHTUNG GESPEICHERT"); line(130, "Die Zugangsdaten wurden gespeichert.", GxEPD_BLACK); line(180, "Der Rahmen startet jetzt neu und", GxEPD_BLACK); line(215, "laedt die Strompreise.", GxEPD_BLACK); } while (display.nextPage()); }
-  void renderNoData(const String &reason, bool maintenanceMode) { display.firstPage(); do { display.fillScreen(GxEPD_WHITE); header("NOCH KEINE PREISDATEN"); if (maintenanceMode) {
-      const int barY = 66, barH = 20;
-      display.fillRect(20, barY, 760, barH, GxEPD_BLACK);
-      display.setTextColor(GxEPD_WHITE);
-      display.setFont(&FreeMonoBold9pt7b);
-      display.setCursor(28, barY + 15);
-      display.print("WARTUNGSMODUS AKTIV - KEY CA. 5 SEK. HALTEN ZUM BEENDEN");
+  void renderNoData(const String &reason, bool maintenanceMode, const String &installedAt = "") { display.firstPage(); do { display.fillScreen(GxEPD_WHITE); header("NOCH KEINE PREISDATEN"); if (maintenanceMode) {
+      maintenanceBanner(installedAt);
     } line(130, "WLAN oder Tibber-Verbindung pruefen.", GxEPD_RED); line(180, "Status: " + reason); line(250, "KEY 15 Sekunden halten: Neueinrichtung"); } while (display.nextPage()); }
-  void render(const PriceSnapshot &s, const PriceAssessment &a, bool maintenanceMode, const BatteryStatus &battery) {
+  void render(const PriceSnapshot &s, const PriceAssessment &a, bool maintenanceMode, const BatteryStatus &battery, const String &installedAt = "") {
     auto centered = [this](const String &text, int centerX, int baselineY) {
       int16_t x1, y1; uint16_t w, h;
       display.getTextBounds(text.c_str(), 0, 0, &x1, &y1, &w, &h);
@@ -439,12 +469,7 @@ class DisplayDriver {
       uint16_t statusTextColor = (a.category == "NORMAL") ? GxEPD_BLACK : GxEPD_WHITE;
       display.setTextColor(statusTextColor); display.setFont(&FreeMonoBold12pt7b); centered(a.category, 690, 47);
       if (maintenanceMode) {
-        const int barY = 66, barH = 20;
-        display.fillRect(20, barY, 760, barH, GxEPD_BLACK);
-        display.setTextColor(GxEPD_WHITE);
-        display.setFont(&FreeMonoBold9pt7b);
-        display.setCursor(28, barY + 15);
-        display.print("WARTUNGSMODUS AKTIV - KEY CA. 5 SEK. HALTEN ZUM BEENDEN");
+        maintenanceBanner(installedAt);
       }
 
       String price = String(a.currentCt, 1);
@@ -989,6 +1014,22 @@ void setup() {
   }
 
   setenv("TZ", AppConfig::TIMEZONE, 1); tzset();
+
+  // Welche Version seit wann installiert ist, fuer die Anzeige im
+  // Wartungsmodus (main.cpp DisplayDriver::maintenanceBanner). Erst bei
+  // gueltiger Uhrzeit schreiben, sonst wuerde ein Boot vor dem ersten
+  // NTP-Sync das Datum dauerhaft auf Epoch (1970 lokal) festnageln.
+  String installedAt;
+  {
+    String installedVersion;
+    storage.loadFirmwareInstallInfo(installedVersion, installedAt);
+    const time_t nowForInstall = time(nullptr);
+    if (installedVersion != AppConfig::FIRMWARE_VERSION && nowForInstall >= 1700000000) {
+      installedAt = localDateString(nowForInstall);
+      storage.saveFirmwareInstallInfo(AppConfig::FIRMWARE_VERSION, installedAt);
+    }
+  }
+
   Wire.begin(PMIC_SDA, PMIC_SCL);
   Wire.setTimeOut(50);
 
@@ -1131,8 +1172,8 @@ void setup() {
 
   // The display and its SPI bus are initialized only for an actual draw, never for a network-only wake.
   display.ensureReady();
-  if (!cached) display.renderNoData(failure.isEmpty() ? "WLAN nicht erreichbar" : failure, maintenanceMode);
-  else display.render(snapshot, assess(snapshot), maintenanceMode, readBatteryStatus());
+  if (!cached) display.renderNoData(failure.isEmpty() ? "WLAN nicht erreichbar" : failure, maintenanceMode, installedAt);
+  else display.render(snapshot, assess(snapshot), maintenanceMode, readBatteryStatus(), installedAt);
   display.sleep();
 
   // OTA-Rollback-Bestaetigung: ein vollstaendiger Zyklus bis hierher (Preise
