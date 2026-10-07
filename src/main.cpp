@@ -1,6 +1,13 @@
 // ============================================================================
-// VERSION: BETA - basiert auf v1.2.0 (stable)
+// VERSION: 1.3.0-beta1 - basiert auf v1.2.0 (stable)
 // Branch: experimente
+//
+// FIRMWARE_VERSION (unten in AppConfig) muss sich von der zuletzt
+// geflashten Version unterscheiden, sonst zeigt der Wartungsmodus-Banner
+// weiterhin die alte Versionsnummer/das alte Installationsdatum an (siehe
+// main.cpp: installedVersion != AppConfig::FIRMWARE_VERSION-Check). Bei
+// jeder weiteren Aenderung auf diesem Branch VOR dem naechsten Hardwaretest
+// also pruefen, ob die Versionsnummer noch hochgezaehlt werden muss.
 //
 // Aktuelles Experiment, noch nicht auf Hardware verifiziert:
 // - Automatisches OTA-Rollback: OtaUpdater::checkAndApply() setzt vor dem
@@ -225,7 +232,7 @@ constexpr char AP_PASSWORD_PREFIX[] = "preis-";
 // Muss bei jedem Release, das ueber GitHub veroeffentlicht wird, auf den
 // neuen Tag-Namen (ohne fuehrendes "v") gesetzt werden - der Vergleich in
 // OtaUpdater ist ein reiner String-Abgleich, keine semantische Versionslogik.
-constexpr char FIRMWARE_VERSION[] = "1.2.0";
+constexpr char FIRMWARE_VERSION[] = "1.3.0-beta1";
 constexpr char OTA_RELEASES_API_URL[] = "https://api.github.com/repos/Fritzeb/tibber_display/releases/latest";
 constexpr char OTA_ASSET_NAME[] = "firmware.bin";
 // Wie viele Boot-Versuche eine frische OTA-Version hat, um einen
