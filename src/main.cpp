@@ -1,5 +1,5 @@
 // ============================================================================
-// VERSION: 1.3.0-beta1 - basiert auf v1.2.0 (stable)
+// VERSION: 1.3.1-beta1 - basiert auf v1.3.0 (stable)
 // Branch: experimente
 //
 // FIRMWARE_VERSION (unten in AppConfig) muss sich von der zuletzt
@@ -10,6 +10,15 @@
 // also pruefen, ob die Versionsnummer noch hochgezaehlt werden muss.
 //
 // Aktuelles Experiment, noch nicht auf Hardware verifiziert:
+// - Tibbers eigenes "level"-Feld (CHEAP/NORMAL/EXPENSIVE/...) wird jetzt mit
+//   abgefragt und pro PricePoint mitgefuehrt (PriceProvider::fetch()), bisher
+//   rein diagnostisch per Serial.println geloggt - fliesst NICHT in
+//   assess()/render() ein. Zweck: pruefen, was Tibber fuer dieses Konto
+//   tatsaechlich zurueckliefert, als Diskussionsgrundlage fuer eine moegliche
+//   Abloesung der lokalen p25Ct/p75Ct-Schwellenlogik (siehe unten) durch
+//   Tibbers eigene Einstufung.
+//
+// Bereits in v1.3.0 (stable) enthalten:
 // - Automatisches OTA-Rollback: OtaUpdater::checkAndApply() setzt vor dem
 //   Neustart nach einem Update ein "otaPending"-Flag (Storage). Der
 //   Rollback-Check am Anfang von setup() (vor Wire/AXP2101/WLAN-Init, damit
@@ -21,18 +30,20 @@
 //   vollstaendiger, bis zum Deep Sleep durchlaufener Zyklus loescht das Flag
 //   stattdessen (Bestaetigung, kurz vor dem Wartungsmodus-/Sleep-Zweig in
 //   setup()). Deckt Abstuerze/Haenger ab, die ueber Watchdog-Reset oder
-//   manuellen Reset enden - keine Erkennung fuer ein Firmware, das zwar
+//   manuellen Reset enden - keine Erkennung fuer eine Firmware, die zwar
 //   lauffaehig bleibt, aber falsch funktioniert (z.B. falsche Preise
-//   anzeigt), da dafuer kein automatisches Kriterium existiert.
-// - Wartungsmodus zeigt jetzt Firmware-Version und Installationsdatum in der
+//   anzeigt), da dafuer kein automatisches Kriterium existiert. NICHT auf
+//   Hardware verifiziert - bewusste Entscheidung, ohne einen echten
+//   3x-Fehlschlag-Testlauf zu releasen.
+// - Wartungsmodus zeigt Firmware-Version und Installationsdatum in der
 //   schwarzen Banner-Zeile (DisplayDriver::maintenanceBanner). Das Datum wird
 //   in Storage::fwVersion/fwInstalledAt vermerkt, sobald eine Version zum
 //   ersten Mal eine gueltige Uhrzeit sieht, die vom zuletzt vermerkten Stand
 //   abweicht (neue Version oder allererster Boot) - unabhaengig vom
 //   OTA-Rollback-Mechanismus, da das Datum auch beim allerersten USB-Flash
-//   stimmen soll, nicht nur nach einem OTA-Update.
+//   stimmen soll, nicht nur nach einem OTA-Update. Auf Hardware verifiziert.
 //
-// Bereits in v1.2.0 (stable) enthalten:
+// Bereits in v1.2.0 enthalten:
 // - Diagramm-Bug behoben: ein toter Fallback in PriceProvider::fetch() hing
 //   bei fehlendem Treffer einen Zusatzpunkt an "today" an (ungenutzt, da
 //   setup() currentIndex ohnehin per computeCurrentIndex() ueberschreibt).
@@ -47,10 +58,8 @@
 //   OtaUpdater), danach Neustart. Voraussetzung: eigene OTA-faehige
 //   Partitionstabelle (partitions.csv, otadata + ota_0/ota_1 statt
 //   default_16MB.csv) - der erste Flash mit dieser Tabelle MUSS per USB
-//   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. In
-//   v1.2.0 noch kein automatisches Rollback bei einer defekten neuen Version
-//   (siehe aktuelles Experiment oben). Auf Hardware verifiziert (ein Geraet,
-//   USB-geflasht).
+//   erfolgen, eine Partitionstabelle laesst sich nicht per OTA aendern. Auf
+//   Hardware verifiziert (ein Geraet, USB-geflasht).
 // - Bug behoben: NTP-Resync war nach dem allerersten Mal wirkungslos, die
 //   Uhr driftete seither unbemerkt (beobachtet: stuendlicher Refresh
 //   wanderte ueber mehrere Tage von "Punkt Uhr" auf "viertel vor"). Fix
@@ -142,13 +151,17 @@ struct PricePoint {
   String startsAt;
   float totalEurPerKwh = 0;
   String currency = "EUR";
+  // Tibbers eigene Preis-Einstufung (z.B. "CHEAP"/"NORMAL"/"EXPENSIVE"),
+  // nur zu Diagnosezwecken mitgefuehrt (siehe Serial-Log in
+  // PriceProvider::fetch) - fliesst bisher NICHT in assess()/render() ein.
+  String level;
   PricePoint() = default;
   // Expliziter Konstruktor: Default-Werte oben machen die Struktur unter
   // C++11 (PlatformIOs Standardeinstellung fuer diese Arduino-Toolchain) zu
   // keinem Aggregate mehr - push_back({a, b, c}) braucht daher diesen
   // Konstruktor statt Aggregate-Initialisierung.
-  PricePoint(String startsAt_, float totalEurPerKwh_, String currency_)
-      : startsAt(std::move(startsAt_)), totalEurPerKwh(totalEurPerKwh_), currency(std::move(currency_)) {}
+  PricePoint(String startsAt_, float totalEurPerKwh_, String currency_, String level_ = "")
+      : startsAt(std::move(startsAt_)), totalEurPerKwh(totalEurPerKwh_), currency(std::move(currency_)), level(std::move(level_)) {}
 };
 
 struct PriceSnapshot {
@@ -232,7 +245,7 @@ constexpr char AP_PASSWORD_PREFIX[] = "preis-";
 // Muss bei jedem Release, das ueber GitHub veroeffentlicht wird, auf den
 // neuen Tag-Namen (ohne fuehrendes "v") gesetzt werden - der Vergleich in
 // OtaUpdater ist ein reiner String-Abgleich, keine semantische Versionslogik.
-constexpr char FIRMWARE_VERSION[] = "1.3.0-beta1";
+constexpr char FIRMWARE_VERSION[] = "1.3.1-beta1";
 constexpr char OTA_RELEASES_API_URL[] = "https://api.github.com/repos/Fritzeb/tibber_display/releases/latest";
 constexpr char OTA_ASSET_NAME[] = "firmware.bin";
 // Wie viele Boot-Versuche eine frische OTA-Version hat, um einen
@@ -739,7 +752,7 @@ class TibberConnection {
 };
 
 class PriceProvider {
-  static void points(JsonArray a, std::vector<PricePoint> &out) { for (JsonObject x : a) if (!x["startsAt"].isNull() && !x["total"].isNull()) out.push_back({x["startsAt"] | "", x["total"] | 0.0F, x["currency"] | "EUR"}); }
+  static void points(JsonArray a, std::vector<PricePoint> &out) { for (JsonObject x : a) if (!x["startsAt"].isNull() && !x["total"].isNull()) out.push_back({x["startsAt"] | "", x["total"] | 0.0F, x["currency"] | "EUR", x["level"] | ""}); }
  public:
   bool fetch(const RuntimeConfig &cfg, PriceSnapshot &out, String &reason) {
     WiFiClientSecure tls; tls.setInsecure();
@@ -748,7 +761,7 @@ class PriceProvider {
     http.setTimeout(10000);
     if (!http.begin(tls, AppConfig::TIBBER_URL)) { reason = "api"; return false; }
     http.addHeader("Authorization", String("Bearer ") + cfg.tibberToken); http.addHeader("Content-Type", "application/json");
-    const char *body = R"({"query":"query GetPriceInfo { viewer { homes { id currentSubscription { priceInfo { current { total startsAt currency } today { total startsAt currency } tomorrow { total startsAt currency } } } } } }"})";
+    const char *body = R"({"query":"query GetPriceInfo { viewer { homes { id currentSubscription { priceInfo { current { total startsAt currency level } today { total startsAt currency level } tomorrow { total startsAt currency level } } } } } }"})";
     int code = http.POST(body);
     String payload = code > 0 ? http.getString() : ""; http.end(); if (code == 401 || code == 403) { reason = "authorisierung"; return false; } if (code != 200) { reason = "api"; return false; }
     JsonDocument d; if (deserializeJson(d, payload) || !d["errors"].isNull()) { reason = "api"; return false; } JsonArray homes = d["data"]["viewer"]["homes"].as<JsonArray>(); if (homes.isNull() || homes.size() == 0) { reason = "api"; return false; }
@@ -756,6 +769,11 @@ class PriceProvider {
     // first returned Home. No Home ID is requested or stored in this project.
     JsonObject home = homes[0];
     JsonObject info = home["currentSubscription"]["priceInfo"]; if (info.isNull()) { reason = "keine-preise"; return false; } out = PriceSnapshot(); out.homeId = home["id"].as<String>(); points(info["today"].as<JsonArray>(), out.today); points(info["tomorrow"].as<JsonArray>(), out.tomorrow); if (out.today.empty()) { reason = "keine-preise"; return false; }
+    // Diagnose fuer den level-Feld-Test: zeigt,
+    // was Tibber fuer dieses Konto tatsaechlich als Einstufung zurueckgibt -
+    // bisher ungenutzt, nur zum Vergleich mit der lokalen assess()-Logik.
+    Serial.println("Diagnose: Tibber-Preisstufen (level) heute:");
+    for (const auto &pt : out.today) Serial.printf("  %s: %.1f ct, level=%s\n", pt.startsAt.c_str(), pt.totalEurPerKwh * 100.0F, pt.level.isEmpty() ? "(leer)" : pt.level.c_str());
     // currentIndex wird nicht hier gesetzt: setup() ueberschreibt ihn nach
     // jedem Abruf ohnehin mit computeCurrentIndex() (anhand der Uhrzeit, nicht
     // des API-Felds "current"). Ein frueherer Fallback haengte bei fehlendem
